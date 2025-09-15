@@ -11,61 +11,8 @@ try:
 except ImportError:
     _HAVE_PRO_ANG1 = False
 
-def build_window_LUT(window_fn,
-                     m: int,
-                     pixel_size: float,
-                     n_samples: int = 4096,
-                     **window_kwargs):
-    """
-    Precompute symmetric samples of a window over its support for fast interpolation.
 
-    Returns
-    -------
-    coords : 1D array of distances (≥0) where window sampled
-    values : window(distances) with center at 0
-    """
-    # We sample distances from 0 .. half_width
-    half_width = 0.5 * m * pixel_size
-    d = np.linspace(0.0, half_width, n_samples)
-    # Evaluate window by calling with u = center + d AND u = center - d (evenness assumed)
-    # We'll exploit even symmetry, so just evaluate once.
-    vals = window_fn(center + d, center, pixel_size=pixel_size, m=m, **window_kwargs)
-    # Force last sample to 0 (or near) for numeric cleanliness
-    vals[-1] = 0.0
-    return d, vals
-
-
-def evaluate_from_LUT(dist_array, d_samples, v_samples):
-    """
-    dist_array : |u - center| distances
-    d_samples, v_samples : LUT from build_window_LUT
-    Linear interpolation (could switch to np.interp).
-    """
-    dist_array = np.asarray(dist_array)
-    half_width = d_samples[-1]
-    out = np.zeros_like(dist_array, dtype=float)
-    mask = dist_array <= half_width
-    out[mask] = np.interp(dist_array[mask], d_samples, v_samples)
-    return out
-
-
-class LUTWindow:
-    """
-    Callable object matching the signature window(u, center).
-    Wraps a precomputed lookup table for a specific kernel configuration.
-    """
-    __slots__ = ("pixel_size", "m", "d_samples", "v_samples")
-
-    def __init__(self, pixel_size, m, d_samples, v_samples):
-        self.pixel_size = pixel_size
-        self.m = m
-        self.d_samples = d_samples
-        self.v_samples = v_samples
-
-    def __call__(self, u, center):
-        u = _ensure_array(u)
-        dist = np.abs(u - center)
-        return evaluate_from_LUT(dist, self.d_samples, self.v_samples)
+# Main gridding code
 def bin_data(u, v, values, weights, bins,
              window_fn: Callable,
              truncation_radius,
@@ -147,3 +94,4 @@ def bin_data(u, v, values, weights, bins,
     if verbose:
         print(f"Number of coarsened pixels: {n_coarse}")
     return grid
+
