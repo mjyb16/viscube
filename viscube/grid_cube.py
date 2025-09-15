@@ -3,6 +3,7 @@ from typing import Callable, Tuple, Sequence, Optional, Union
 import numpy as np
 from numpy.typing import ArrayLike
 from scipy.spatial import cKDTree
+import inspect
 
 # Use your existing implementations
 from .gridder import bin_data
@@ -148,26 +149,43 @@ def grid_channel(
 # User-facing helpers
 # -----------------------
 
+def _bind_window(fn: Callable, pixel_size: float, window_kwargs: Optional[dict]) -> Callable[[ArrayLike, float], np.ndarray]:
+    """
+    Return a callable window(u, center) with kwargs safely bound.
+    Only passes arguments that `fn` actually accepts.
+    Always passes pixel_size if `fn` accepts it and it's not already provided.
+    """
+    params = inspect.signature(fn).parameters
+    kw = dict(window_kwargs or {})
+    if "pixel_size" in params and "pixel_size" not in kw:
+        kw["pixel_size"] = pixel_size
+
+    # keep it minimal: caller can pass m/beta/normalize/etc in window_kwargs
+    return lambda u, c, _fn=fn, _kw=kw: _fn(u, c, **_kw)
+
+
 def _window_from_name(name: str,
                       *,
                       pixel_size: float,
-                      m: int = 6,
-                      beta: Optional[float] = None
+                      window_kwargs: Optional[dict] = None
                       ) -> Callable[[ArrayLike, float], np.ndarray]:
     """
-    Convenience: build a window(u, center) callable from a string and args.
-    Note: pixel_size is bound here (computed from the grid).
+    Build a window(u, center) callable from a string and a kwargs dict.
+    No assumptions about which kwargs exist; only forwards what the window accepts.
     """
     key = name.lower()
     if key in {"kb", "kaiser", "kaiser_bessel", "kaiser-bessel"}:
-        return lambda u, c: kaiser_bessel_window(u, c, pixel_size=pixel_size, m=m, beta=beta)
-    if key in {"pswf", "casa", "spheroidal"}:
-        return lambda u, c: casa_pswf_window(u, c, pixel_size=pixel_size, m=m)
-    if key in {"pillbox", "boxcar"}:
-        return lambda u, c: pillbox_window(u, c, pixel_size=pixel_size, m=m)
-    if key in {"sinc"}:
-        return lambda u, c: sinc_window(u, c, pixel_size=pixel_size, m=m)
-    raise ValueError(f"Unknown window name: {name!r}")
+        base = kaiser_bessel_window
+    elif key in {"pswf", "casa", "spheroidal"}:
+        base = casa_pswf_window
+    elif key in {"pillbox", "boxcar"}:
+        base = pillbox_window
+    elif key == "sinc":
+        base = sinc_window
+    else:
+        raise ValueError(f"Unknown window name: {name!r}")
+
+    return _bind_window(base, pixel_size=pixel_size, window_kwargs=window_kwargs)
 
 
 def grid_cube_simple(
@@ -184,15 +202,28 @@ def grid_cube_simple(
     pad_uv: float = 0.0,
     # Window config (choose either window_name OR pass a ready-made window_fn):
     window_name: Optional[str] = "kaiser_bessel",
-    m: int = 6,
-    beta: Optional[float] = None,
+    window_kwargs: Optional[dict] = None,
     window_fn: Optional[Callable[[ArrayLike, float], np.ndarray]] = None,
     # KD-tree config:
     workers: int = 6,
     p_metric: int = 1,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
-    High-level API: users provide raw UV data + window choice; get back grids.
+    High-level API: users provide raw UV data + a window choice/kwargs; get back grids.
+
+    Parameters
+    ----------
+    window_name : str | None
+        Name of a built-in window ("kaiser_bessel", "pswf"/"casa", "pillbox", "sinc").
+        Ignored if `window_fn` is provided.
+    window_kwargs : dict | None
+        Arbitrary keyword args forwarded to the chosen window function
+        (e.g., {"m": 6, "beta": 8.6, "normalize": True}).
+        Only the kwargs that the window actually accepts will be used.
+        `pixel_size` is automatically injected if the window supports it and it's not given.
+    window_fn : callable | None
+        Custom window function with signature window(u, center, **kwargs).
+        If provided, it will be bound with `window_kwargs` (and `pixel_size` if accepted).
 
     Returns
     -------
@@ -209,11 +240,13 @@ def grid_cube_simple(
     u_edges, v_edges, delta_u, trunc_r = make_uv_grid(U, V, npix=npix, pad_uv=pad_uv)
     centers = build_grid_centers(u_edges, v_edges)
 
-    # 4) Build window callable if not provided; bind pixel_size here
-    if window_fn is None:
+    # 4) Build/bind window callable
+    if window_fn is not None:
+        window = _bind_window(window_fn, pixel_size=delta_u, window_kwargs=window_kwargs)
+    else:
         if window_name is None:
             raise ValueError("Provide either window_name or a ready-made window_fn.")
-        window_fn = _window_from_name(window_name, pixel_size=delta_u, m=m, beta=beta)
+        window = _window_from_name(window_name, pixel_size=delta_u, window_kwargs=window_kwargs)
 
     # 5) Loop over channels (uses your bin_data internally)
     F = U.shape[0]
@@ -229,9 +262,8 @@ def grid_cube_simple(
         uv_tree, grid_tree, pairs = precompute_pairs(U[i], V[i], centers, trunc_r, p_metric=p_metric, workers=workers)
         vb_re, sb_re, vb_im, sb_im, cnt = grid_channel(
             U[i], V[i], RE[i], IM[i], W[i],
-            u_edges, v_edges, window_fn, trunc_r,
+            u_edges, v_edges, window, trunc_r,
             uv_tree, grid_tree, pairs,
-            # keep your default verbosities:
             verbose_mean=1, verbose_std=2,
         )
         mean_re[i] = vb_re
@@ -241,7 +273,6 @@ def grid_cube_simple(
         counts[i]  = cnt
 
     return mean_re, mean_im, std_re, std_im, counts, u_edges, v_edges
-
 
 def save_gridded_npz(
     out_path: str,
