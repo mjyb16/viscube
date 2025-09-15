@@ -28,7 +28,7 @@ if extras_require:
 
 # Import meta data from __meta__.py (no version here)
 meta = {}
-exec(read("supermage/__meta__.py"), meta)
+exec(read("viscube/__meta__.py"), meta)
 
 # README handling
 possible_readme_names = ["README.rst", "README.md", "README.txt", "README"]

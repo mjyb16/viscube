@@ -20,16 +20,32 @@ def bin_data(u, v, values, weights, bins,
              grid_tree: cKDTree,
              pairs: Sequence[Sequence[int]],
              statistics_fn="mean",
-             verbose=1,
-             window_kwargs: Optional[Dict] = None):
+             verbose=0,
+             window_kwargs: Optional[Dict] = None,
+             # New: std-only controls (defaults preserve old behavior)
+             std_p: int = 1,
+             std_workers: int = 6,
+             std_min_effective: int = 5,
+             std_expand_step: float = 0.1,
+             # New: return n_coarse for tqdm display when True
+             collect_stats: bool = False):
     """
     Parameters
     ----------
     window_fn : callable
-        Should accept (u_array, center) ONLY (other params captured via partial or LUTWindow).
-        Must return non-negative weights, zero outside support.
+        Accepts (u_array, center). Other params captured via closure/partial.
     window_kwargs : dict, optional
-        (Not used if you already froze params via partial/LUTWindow; kept for backwards compat.)
+        (Kept for backwards compat; not used when window_fn is already bound.)
+    std_p : int
+        `p` metric for cKDTree.query_ball_point during std expansion (default 1).
+    std_workers : int
+        `workers` for cKDTree.query_ball_point during std expansion (default 6).
+    std_min_effective : int
+        Minimum effective sample count before stopping expansion (default 5).
+    std_expand_step : float
+        Multiplicative radius increment per expansion step (default 0.1).
+    collect_stats : bool
+        If True, returns (grid, n_coarse). Otherwise returns grid only.
     """
     u_edges, v_edges = bins
     Nu = len(u_edges) - 1
@@ -37,7 +53,6 @@ def bin_data(u, v, values, weights, bins,
     grid = np.zeros((Nu, Nv), dtype=float)
 
     n_coarse = 0
-    # Iterate per grid center
     for k, data_indices in enumerate(pairs):
         if not data_indices:
             continue
@@ -47,28 +62,25 @@ def bin_data(u, v, values, weights, bins,
         wu = window_fn(u[data_indices], u_center)
         wv = window_fn(v[data_indices], v_center)
         w = weights[data_indices] * wu * wv
-
         if w.sum() <= 0:
             continue
 
         val = values[data_indices]
-        i, j = divmod(k, Nv)   # careful with ordering (Nu major?)
+        i, j = divmod(k, Nv)   # Nu-major ordering outside; fill grid[j, i] (unchanged)
 
         if statistics_fn == "mean":
             grid[j, i] = np.sum(val * w) / np.sum(w)
 
         elif statistics_fn == "std":
-            # Expand adaptively like your original version. Start with given support m=1 concept.
-            # We'll mimic your adaptive m logic by gradually enlarging search radius (L1).
             indices = data_indices
             local_w = w
             effective = (local_w > 0).sum()
             expand = 1.0
-            while effective < 5:
-                expand += 0.1
+            while effective < std_min_effective:
+                expand += std_expand_step
                 indices = uv_tree.query_ball_point([u_center, v_center],
                                                    expand * truncation_radius,
-                                                   p=1, workers=6)
+                                                   p=std_p, workers=std_workers)
                 val = values[indices]
                 wu = window_fn(u[indices], u_center)
                 wv = window_fn(v[indices], v_center)
@@ -76,14 +88,13 @@ def bin_data(u, v, values, weights, bins,
                 effective = (local_w > 0).sum()
             if expand > 1.0:
                 n_coarse += 1
-            # Effective sample size
+
+            # Effective sample size & SE of the mean
             imp = wu * wv
             n_eff = (imp.sum() ** 2) / (np.sum(imp**2) + 1e-12)
-            # Weighted variance
             mean_val = np.sum(val * local_w) / np.sum(local_w)
             var = np.sum(local_w * (val - mean_val)**2) / np.sum(local_w)
-            # Unbiased-ish scaling with effective n
-            grid[j, i] = np.sqrt(var) * np.sqrt(n_eff / (max(n_eff - 1, 1))) * (1 / np.sqrt(n_eff))
+            grid[j, i] = np.sqrt(var) * np.sqrt(n_eff / max(n_eff - 1, 1)) * (1.0 / np.sqrt(n_eff))
 
         elif statistics_fn == "count":
             grid[j, i] = (w > 0).sum()
@@ -91,7 +102,8 @@ def bin_data(u, v, values, weights, bins,
         elif callable(statistics_fn):
             grid[j, i] = statistics_fn(val, w)
 
-    if verbose:
-        print(f"Number of coarsened pixels: {n_coarse}")
+    # `verbose` is deprecated in favor of tqdm in the caller.
+    if collect_stats:
+        return grid, n_coarse
     return grid
 

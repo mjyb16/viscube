@@ -3,7 +3,7 @@ from . import __meta__
 __version__ = __meta__.version
 
 from .grid_cube import (
-    grid_cube_simple,
+    grid_cube_all_stats,
     save_gridded_npz,
     load_and_mask,
     hermitian_augment,

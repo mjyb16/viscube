@@ -4,6 +4,7 @@ import numpy as np
 from numpy.typing import ArrayLike
 from scipy.spatial import cKDTree
 import inspect
+from tqdm import tqdm
 
 # Use your existing implementations
 from .gridder import bin_data
@@ -27,7 +28,8 @@ def load_and_mask(
     mask: np.ndarray,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
-    Apply per-channel mask and compact arrays (exactly like your loop).
+    Apply per-channel mask and compact arrays. 
+    Returns frequencies, u0, v0, vis0, w0.
     """
     F = len(frequencies)
     Nmasked = int(mask[0].sum())
@@ -49,6 +51,7 @@ def hermitian_augment(
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     (u, v, Re, Im, w) -> concat with (-u, -v, +Re, -Im, w)
+    Returns uu, vv, vis_re, vis_imag, w
     """
     uu = np.concatenate([u0, -u0], axis=1)
     vv = np.concatenate([v0, -v0], axis=1)
@@ -76,10 +79,7 @@ def make_uv_grid(
 
 def build_grid_centers(u_edges: np.ndarray, v_edges: np.ndarray) -> np.ndarray:
     """
-    Reproduce your center ordering EXACTLY:
-    outer loop over u bins, inner loop over v bins.
-
-    This preserves downstream `i, j = divmod(k, Nv)` with `grid[j, i]` in bin_data.
+    Measurement Set conventions for grid centers.
     """
     Nu = len(u_edges) - 1
     Nv = len(v_edges) - 1
@@ -100,8 +100,7 @@ def precompute_pairs(
     centers: np.ndarray,
     truncation_radius: float,
     *,
-    p_metric: int = 1,
-    workers: int = 6,
+    p_metric: int = 1
 ) -> Tuple[cKDTree, cKDTree, Sequence[Sequence[int]]]:
     """
     Build KD-trees and query neighbor pairs for a single channel.
@@ -109,7 +108,7 @@ def precompute_pairs(
     uv_points = np.vstack((uu_i.ravel(), vv_i.ravel())).T
     uv_tree = cKDTree(uv_points)
     grid_tree = cKDTree(centers)
-    pairs = grid_tree.query_ball_tree(uv_tree, truncation_radius, p=p_metric, workers=workers)
+    pairs = grid_tree.query_ball_tree(uv_tree, truncation_radius, p=p_metric)
     return uv_tree, grid_tree, pairs
 
 
@@ -188,15 +187,15 @@ def _window_from_name(name: str,
     return _bind_window(base, pixel_size=pixel_size, window_kwargs=window_kwargs)
 
 
-def grid_cube_simple(
+def grid_cube_all_stats(
     *,
     # Required observational inputs:
-    frequencies: np.ndarray,
+    frequencies: np.ndarray,     # kept for API symmetry; unused here
     uu: np.ndarray,
     vv: np.ndarray,
-    vis: np.ndarray,
+    vis_re: np.ndarray,
+    vis_imag: np.ndarray,
     weight: np.ndarray,
-    mask: np.ndarray,
     # Grid config:
     npix: int = 501,
     pad_uv: float = 0.0,
@@ -205,42 +204,25 @@ def grid_cube_simple(
     window_kwargs: Optional[dict] = None,
     window_fn: Optional[Callable[[ArrayLike, float], np.ndarray]] = None,
     # KD-tree config:
-    workers: int = 6,
     p_metric: int = 1,
+    # New: std-only expansion controls passed into bin_data
+    std_workers: int = 6,
+    std_min_effective: int = 5,
+    std_expand_step: float = 0.1,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
-    High-level API: users provide raw UV data + a window choice/kwargs; get back grids.
-
-    Parameters
-    ----------
-    window_name : str | None
-        Name of a built-in window ("kaiser_bessel", "pswf"/"casa", "pillbox", "sinc").
-        Ignored if `window_fn` is provided.
-    window_kwargs : dict | None
-        Arbitrary keyword args forwarded to the chosen window function
-        (e.g., {"m": 6, "beta": 8.6, "normalize": True}).
-        Only the kwargs that the window actually accepts will be used.
-        `pixel_size` is automatically injected if the window supports it and it's not given.
-    window_fn : callable | None
-        Custom window function with signature window(u, center, **kwargs).
-        If provided, it will be bound with `window_kwargs` (and `pixel_size` if accepted).
+    High-level API: provide raw UV data + a window choice/kwargs; get back gridded data.
 
     Returns
     -------
     mean_re, mean_im, std_re, std_im, counts, u_edges, v_edges
         Each grid has shape (F, Nu, Nv).
     """
-    # 1) Mask + compact
-    _, u0, v0, vis0, w0 = load_and_mask(frequencies, uu, vv, vis, weight, mask)
-
-    # 2) Hermitian augment
-    U, V, RE, IM, W = hermitian_augment(u0, v0, vis0, w0)
-
-    # 3) Build grid (pixel_size == delta_u)
-    u_edges, v_edges, delta_u, trunc_r = make_uv_grid(U, V, npix=npix, pad_uv=pad_uv)
+    # 1) Build grid (pixel_size == delta_u)
+    u_edges, v_edges, delta_u, trunc_r = make_uv_grid(uu, vv, npix=npix, pad_uv=pad_uv)
     centers = build_grid_centers(u_edges, v_edges)
 
-    # 4) Build/bind window callable
+    # 2) Build/bind window callable
     if window_fn is not None:
         window = _bind_window(window_fn, pixel_size=delta_u, window_kwargs=window_kwargs)
     else:
@@ -248,8 +230,8 @@ def grid_cube_simple(
             raise ValueError("Provide either window_name or a ready-made window_fn.")
         window = _window_from_name(window_name, pixel_size=delta_u, window_kwargs=window_kwargs)
 
-    # 5) Loop over channels (uses your bin_data internally)
-    F = U.shape[0]
+    # 3) Allocate outputs
+    F = uu.shape[0]
     Nu = len(u_edges) - 1
     Nv = len(v_edges) - 1
     mean_re = np.zeros((F, Nu, Nv), dtype=np.float64)
@@ -258,21 +240,59 @@ def grid_cube_simple(
     std_im  = np.zeros((F, Nu, Nv), dtype=np.float64)
     counts  = np.zeros((F, Nu, Nv), dtype=np.float64)
 
-    for i in range(F):
-        uv_tree, grid_tree, pairs = precompute_pairs(U[i], V[i], centers, trunc_r, p_metric=p_metric, workers=workers)
-        vb_re, sb_re, vb_im, sb_im, cnt = grid_channel(
-            U[i], V[i], RE[i], IM[i], W[i],
-            u_edges, v_edges, window, trunc_r,
-            uv_tree, grid_tree, pairs,
-            verbose_mean=1, verbose_std=2,
-        )
+    # 4) Loop with tqdm + postfix showing coarsened pixels for std
+    pbar = tqdm(range(F), unit="channel")
+    for i in pbar:
+        uv_tree, grid_tree, pairs = precompute_pairs(uu[i], vv[i], centers, trunc_r, p_metric=p_metric)
+
+        # mean (Re/Im)
+        vb_re = bin_data(uu[i], vv[i], vis_re[i], weight[i], (u_edges, v_edges),
+                         window, trunc_r, uv_tree, grid_tree, pairs,
+                         statistics_fn="mean", verbose=0)
+        vb_im = bin_data(uu[i], vv[i], vis_imag[i], weight[i], (u_edges, v_edges),
+                         window, trunc_r, uv_tree, grid_tree, pairs,
+                         statistics_fn="mean", verbose=0)
+
+        # std (Re/Im) with stats collected
+        sb_re, n_coarse_re = bin_data(uu[i], vv[i], vis_re[i], weight[i], (u_edges, v_edges),
+                                      window, trunc_r, uv_tree, grid_tree, pairs,
+                                      statistics_fn="std", verbose=0,
+                                      std_p=p_metric,
+                                      std_workers=std_workers,
+                                      std_min_effective=std_min_effective,
+                                      std_expand_step=std_expand_step,
+                                      collect_stats=True)
+        sb_im, n_coarse_im = bin_data(uu[i], vv[i], vis_imag[i], weight[i], (u_edges, v_edges),
+                                      window, trunc_r, uv_tree, grid_tree, pairs,
+                                      statistics_fn="std", verbose=0,
+                                      std_p=p_metric,
+                                      std_workers=std_workers,
+                                      std_min_effective=std_min_effective,
+                                      std_expand_step=std_expand_step,
+                                      collect_stats=True)
+
+        # counts
+        cnt = bin_data(uu[i], vv[i], vis_re[i], weight[i], (u_edges, v_edges),
+                       window, trunc_r, uv_tree, grid_tree, pairs,
+                       statistics_fn="count", verbose=0)
+
+        # store
         mean_re[i] = vb_re
-        std_re[i]  = sb_re
         mean_im[i] = vb_im
+        std_re[i]  = sb_re
         std_im[i]  = sb_im
         counts[i]  = cnt
 
-    return mean_re, mean_im, std_re, std_im, counts, u_edges, v_edges
+        # tqdm postfix with std coarsening info
+        pbar.set_postfix(coarse_std_re=int(n_coarse_re), coarse_std_im=int(n_coarse_im))
+
+    # flip u-axis (axis=1) to match your NPZ saving convention
+    return (np.flip(np.asarray(mean_re), axis=1),
+            np.flip(np.asarray(mean_im), axis=1),
+            np.flip(np.asarray(std_re),  axis=1),
+            np.flip(np.asarray(std_im),  axis=1),
+            np.flip(np.asarray(counts),  axis=1),
+            u_edges, v_edges)
 
 def save_gridded_npz(
     out_path: str,
@@ -283,15 +303,13 @@ def save_gridded_npz(
     counts: np.ndarray,
 ) -> None:
     """
-    Save NPZ exactly like your notebook snippet:
-        - flip axis=1 (u-axis) for each grid
-        - mask := flipped(counts) > 0
+    Save NPZ of outputs.
     """
     np.savez(
         out_path,
-        vis_bin_re   = np.flip(np.asarray(mean_re), axis=1),
-        vis_bin_imag = np.flip(np.asarray(mean_im), axis=1),
-        std_bin_re   = np.flip(np.asarray(std_re),  axis=1),
-        std_bin_imag = np.flip(np.asarray(std_im),  axis=1),
-        mask         = np.flip(np.asarray(counts) > 0, axis=1),
+        vis_bin_re   = mean_re,
+        vis_bin_imag = mean_im,
+        std_bin_re   = std_re,
+        std_bin_imag = std_im,
+        mask         = counts > 0,
     )
