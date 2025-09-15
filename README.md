@@ -1,2 +1,2 @@
 # viscube
-Visibility-space gridder and spectral cube simulator
+Visibility-space gridder for spectral cubes.
