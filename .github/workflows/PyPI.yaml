@@ -36,11 +36,11 @@ jobs:
         run: |
           TAG="${{ github.event.release.tag_name }}"
           VER="${TAG#v}"  # strip leading 'v' if present
-          META_VER=$(sed -nE "s/^[[:space:]]*version[[:space:]]*=[[:space:]]*['\"]([^'\"]+)['\"]/\\1/p" supermage/__meta__.py)
+          META_VER=$(sed -nE "s/^[[:space:]]*version[[:space:]]*=[[:space:]]*['\"]([^'\"]+)['\"]/\\1/p" visread/__meta__.py)
           echo "meta version: $META_VER"
           echo "tag  version: $VER"
           if [ -z "$META_VER" ]; then
-            echo "ERROR: Could not find version= in supermage/__meta__.py"
+            echo "ERROR: Could not find version= in visread/__meta__.py"
             exit 1
           fi
           if [ "$META_VER" != "$VER" ]; then
