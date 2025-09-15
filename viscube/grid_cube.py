@@ -1,9 +1,21 @@
 from __future__ import annotations
-from typing import Callable, Tuple, Sequence
+from typing import Callable, Tuple, Sequence, Optional, Union
 import numpy as np
 from numpy.typing import ArrayLike
 from scipy.spatial import cKDTree
 
+# Use your existing implementations
+from .gridder import bin_data
+from .windows import (
+    kaiser_bessel_window,
+    casa_pswf_window,
+    pillbox_window,
+    sinc_window,
+)
+
+# -----------------------
+# Low-level utilities (unchanged behavior)
+# -----------------------
 
 def load_and_mask(
     frequencies: np.ndarray,
@@ -15,13 +27,6 @@ def load_and_mask(
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     Apply per-channel mask and compact arrays (exactly like your loop).
-
-    Returns
-    -------
-    freq : (F,)
-    u0, v0 : (F, Nmasked)
-    vis0 : (F, Nmasked) complex128
-    w0   : (F, Nmasked) float64
     """
     F = len(frequencies)
     Nmasked = int(mask[0].sum())
@@ -42,14 +47,7 @@ def hermitian_augment(
     u0: np.ndarray, v0: np.ndarray, vis0: np.ndarray, w0: np.ndarray
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
-    Hermitian augmentation exactly as in your script:
     (u, v, Re, Im, w) -> concat with (-u, -v, +Re, -Im, w)
-
-    Returns
-    -------
-    uu, vv : (F, 2*N)
-    vis_re, vis_imag : (F, 2*N)
-    w : (F, 2*N)
     """
     uu = np.concatenate([u0, -u0], axis=1)
     vv = np.concatenate([v0, -v0], axis=1)
@@ -63,13 +61,7 @@ def make_uv_grid(
     uu: np.ndarray, vv: np.ndarray, npix: int, pad_uv: float
 ) -> Tuple[np.ndarray, np.ndarray, float, float]:
     """
-    Build symmetric square uv grid (unchanged logic).
-
-    Returns
-    -------
-    u_edges, v_edges : (npix+1,)
-    delta_u : float
-    truncation_radius : float (== delta_u)
+    Build symmetric square uv grid; truncation_radius == delta_u.
     """
     maxuv = max(np.abs(uu).max(), np.abs(vv).max())
     u_min = -maxuv * (1.0 + pad_uv)
@@ -77,7 +69,7 @@ def make_uv_grid(
     u_edges = np.linspace(u_min, u_max, npix + 1, dtype=float)
     v_edges = np.linspace(u_min, u_max, npix + 1, dtype=float)
     delta_u = float(u_edges[1] - u_edges[0])
-    truncation_radius = delta_u  # L1 radius, same as your code
+    truncation_radius = delta_u
     return u_edges, v_edges, delta_u, truncation_radius
 
 
@@ -86,7 +78,7 @@ def build_grid_centers(u_edges: np.ndarray, v_edges: np.ndarray) -> np.ndarray:
     Reproduce your center ordering EXACTLY:
     outer loop over u bins, inner loop over v bins.
 
-    This preserves the downstream `i, j = divmod(k, Nv)` with `grid[j, i]` in your bin_data.
+    This preserves downstream `i, j = divmod(k, Nv)` with `grid[j, i]` in bin_data.
     """
     Nu = len(u_edges) - 1
     Nv = len(v_edges) - 1
@@ -104,8 +96,6 @@ def build_grid_centers(u_edges: np.ndarray, v_edges: np.ndarray) -> np.ndarray:
 def precompute_pairs(
     uu_i: np.ndarray,
     vv_i: np.ndarray,
-    u_edges: np.ndarray,
-    v_edges: np.ndarray,
     centers: np.ndarray,
     truncation_radius: float,
     *,
@@ -113,7 +103,7 @@ def precompute_pairs(
     workers: int = 6,
 ) -> Tuple[cKDTree, cKDTree, Sequence[Sequence[int]]]:
     """
-    Build KD-trees and query neighbor pairs for a single channel (same as your loop).
+    Build KD-trees and query neighbor pairs for a single channel.
     """
     uv_points = np.vstack((uu_i.ravel(), vv_i.ravel())).T
     uv_tree = cKDTree(uv_points)
@@ -136,22 +126,12 @@ def grid_channel(
     grid_tree: cKDTree,
     pairs: Sequence[Sequence[int]],
     *,
-    bin_data: Callable = None,
     verbose_mean: int = 1,
     verbose_std: int = 2,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
-    Grid one frequency channel using your existing `bin_data`.
-
-    Notes
-    -----
-    - Keeps your statistics functions and verbosity defaults:
-        mean -> verbose=1, std -> verbose=2, count -> verbose=1
-    - Does NOT alter the `grid[j, i]` behavior inside `bin_data`.
+    Grid one frequency channel using your existing bin_data.
     """
-    if bin_data is None:
-        raise ValueError("Please pass your existing bin_data via the `bin_data` argument.")
-
     bins = (u_edges, v_edges)
     params = (uu_i, vv_i, w_i, bins, window_fn, truncation_radius, uv_tree, grid_tree, pairs)
 
@@ -164,33 +144,81 @@ def grid_channel(
     return vis_bin_re, std_bin_re, vis_bin_imag, std_bin_imag, counts
 
 
-def grid_all_channels(
+# -----------------------
+# User-facing helpers
+# -----------------------
+
+def _window_from_name(name: str,
+                      *,
+                      pixel_size: float,
+                      m: int = 6,
+                      beta: Optional[float] = None
+                      ) -> Callable[[ArrayLike, float], np.ndarray]:
+    """
+    Convenience: build a window(u, center) callable from a string and args.
+    Note: pixel_size is bound here (computed from the grid).
+    """
+    key = name.lower()
+    if key in {"kb", "kaiser", "kaiser_bessel", "kaiser-bessel"}:
+        return lambda u, c: kaiser_bessel_window(u, c, pixel_size=pixel_size, m=m, beta=beta)
+    if key in {"pswf", "casa", "spheroidal"}:
+        return lambda u, c: casa_pswf_window(u, c, pixel_size=pixel_size, m=m)
+    if key in {"pillbox", "boxcar"}:
+        return lambda u, c: pillbox_window(u, c, pixel_size=pixel_size, m=m)
+    if key in {"sinc"}:
+        return lambda u, c: sinc_window(u, c, pixel_size=pixel_size, m=m)
+    raise ValueError(f"Unknown window name: {name!r}")
+
+
+def grid_cube_simple(
+    *,
+    # Required observational inputs:
+    frequencies: np.ndarray,
     uu: np.ndarray,
     vv: np.ndarray,
-    vis_re: np.ndarray,
-    vis_imag: np.ndarray,
-    w: np.ndarray,
-    u_edges: np.ndarray,
-    v_edges: np.ndarray,
-    centers: np.ndarray,
-    window_fn: Callable[[ArrayLike, float], np.ndarray],
-    truncation_radius: float,
-    *,
-    bin_data: Callable,
+    vis: np.ndarray,
+    weight: np.ndarray,
+    mask: np.ndarray,
+    # Grid config:
+    npix: int = 501,
+    pad_uv: float = 0.0,
+    # Window config (choose either window_name OR pass a ready-made window_fn):
+    window_name: Optional[str] = "kaiser_bessel",
+    m: int = 6,
+    beta: Optional[float] = None,
+    window_fn: Optional[Callable[[ArrayLike, float], np.ndarray]] = None,
+    # KD-tree config:
     workers: int = 6,
     p_metric: int = 1,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
-    Loop over channels and grid each one with the same behavior as your current script.
+    High-level API: users provide raw UV data + window choice; get back grids.
 
     Returns
     -------
-    mean_re, std_re, mean_im, std_im, counts : arrays with shape (F, Nu, Nv)
+    mean_re, mean_im, std_re, std_im, counts, u_edges, v_edges
+        Each grid has shape (F, Nu, Nv).
     """
-    F = uu.shape[0]
+    # 1) Mask + compact
+    _, u0, v0, vis0, w0 = load_and_mask(frequencies, uu, vv, vis, weight, mask)
+
+    # 2) Hermitian augment
+    U, V, RE, IM, W = hermitian_augment(u0, v0, vis0, w0)
+
+    # 3) Build grid (pixel_size == delta_u)
+    u_edges, v_edges, delta_u, trunc_r = make_uv_grid(U, V, npix=npix, pad_uv=pad_uv)
+    centers = build_grid_centers(u_edges, v_edges)
+
+    # 4) Build window callable if not provided; bind pixel_size here
+    if window_fn is None:
+        if window_name is None:
+            raise ValueError("Provide either window_name or a ready-made window_fn.")
+        window_fn = _window_from_name(window_name, pixel_size=delta_u, m=m, beta=beta)
+
+    # 5) Loop over channels (uses your bin_data internally)
+    F = U.shape[0]
     Nu = len(u_edges) - 1
     Nv = len(v_edges) - 1
-
     mean_re = np.zeros((F, Nu, Nv), dtype=np.float64)
     std_re  = np.zeros((F, Nu, Nv), dtype=np.float64)
     mean_im = np.zeros((F, Nu, Nv), dtype=np.float64)
@@ -198,13 +226,13 @@ def grid_all_channels(
     counts  = np.zeros((F, Nu, Nv), dtype=np.float64)
 
     for i in range(F):
-        uv_tree, grid_tree, pairs = precompute_pairs(
-            uu[i], vv[i], u_edges, v_edges, centers, truncation_radius, p_metric=p_metric, workers=workers
-        )
+        uv_tree, grid_tree, pairs = precompute_pairs(U[i], V[i], centers, trunc_r, p_metric=p_metric, workers=workers)
         vb_re, sb_re, vb_im, sb_im, cnt = grid_channel(
-            uu[i], vv[i], vis_re[i], vis_imag[i], w[i],
-            u_edges, v_edges, window_fn, truncation_radius,
-            uv_tree, grid_tree, pairs, bin_data=bin_data
+            U[i], V[i], RE[i], IM[i], W[i],
+            u_edges, v_edges, window_fn, trunc_r,
+            uv_tree, grid_tree, pairs,
+            # keep your default verbosities:
+            verbose_mean=1, verbose_std=2,
         )
         mean_re[i] = vb_re
         std_re[i]  = sb_re
@@ -212,4 +240,27 @@ def grid_all_channels(
         std_im[i]  = sb_im
         counts[i]  = cnt
 
-    return mean_re, std_re, mean_im, std_im, counts
+    return mean_re, mean_im, std_re, std_im, counts, u_edges, v_edges
+
+
+def save_gridded_npz(
+    out_path: str,
+    mean_re: np.ndarray,
+    mean_im: np.ndarray,
+    std_re: np.ndarray,
+    std_im: np.ndarray,
+    counts: np.ndarray,
+) -> None:
+    """
+    Save NPZ exactly like your notebook snippet:
+        - flip axis=1 (u-axis) for each grid
+        - mask := flipped(counts) > 0
+    """
+    np.savez(
+        out_path,
+        vis_bin_re   = np.flip(np.asarray(mean_re), axis=1),
+        vis_bin_imag = np.flip(np.asarray(mean_im), axis=1),
+        std_bin_re   = np.flip(np.asarray(std_re),  axis=1),
+        std_bin_imag = np.flip(np.asarray(std_im),  axis=1),
+        mask         = np.flip(np.asarray(counts) > 0, axis=1),
+    )
