@@ -3,7 +3,7 @@
 
 title: viscube
 author: Michael James Yantovski Barth
-#logo: ../../media/caskade_logo_dark.png
+logo: ../../Viscube_logo.svg
 
 # Force re-execution of notebooks on each build.
 # See https://jupyterbook.org/content/execute.html
