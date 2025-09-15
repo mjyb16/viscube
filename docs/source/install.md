@@ -1,4 +1,4 @@
-# visread
+# viscube
 
 ## Install
 Installation instructions here:
