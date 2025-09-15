@@ -33,7 +33,7 @@ build:
       # Create font cache ahead of jupyter book
       - 'python -c "import matplotlib.pyplot as plt"'
       # Get the API documentation dynamically
-      - "sphinx-apidoc -f -o docs/source/ src/caskade/"
+      - "sphinx-apidoc -f -o docs/source/ viscube/"
 
 python:
   install:
