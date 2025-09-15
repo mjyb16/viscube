@@ -8,10 +8,7 @@ author: Michael James Yantovski Barth
 # Force re-execution of notebooks on each build.
 # See https://jupyterbook.org/content/execute.html
 execute:
-  execute_notebooks: force
-  allow_errors: false
-  # Per-cell notebook execution limit (seconds)
-  timeout: 300
+  execute_notebooks: 'off'
 
 # Define the name of the latex output file for PDF builds
 # latex:
