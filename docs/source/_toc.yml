@@ -5,4 +5,4 @@ format: jb-book
 root: intro
 chapters:
   - file: install
-  - file: notebooks/example_ngc4697
+  - file: notebooks/example_casa
