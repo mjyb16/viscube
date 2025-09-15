@@ -30,7 +30,7 @@ repository:
 html:
   use_issues_button: true
   use_repository_button: true
-  favicon: ../../media/caskade_favicon.ico
+  #favicon: ../../media/caskade_favicon.ico
 
 sphinx:
   extra_extensions:
