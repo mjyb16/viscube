@@ -294,22 +294,3 @@ def grid_cube_all_stats(
             np.flip(np.asarray(counts),  axis=1),
             u_edges, v_edges)
 
-def save_gridded_npz(
-    out_path: str,
-    mean_re: np.ndarray,
-    mean_im: np.ndarray,
-    std_re: np.ndarray,
-    std_im: np.ndarray,
-    counts: np.ndarray,
-) -> None:
-    """
-    Save NPZ of outputs.
-    """
-    np.savez(
-        out_path,
-        vis_bin_re   = mean_re,
-        vis_bin_imag = mean_im,
-        std_bin_re   = std_re,
-        std_bin_imag = std_im,
-        mask         = counts > 0,
-    )
