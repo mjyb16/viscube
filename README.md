@@ -5,4 +5,4 @@
 </picture>
 
 # viscube
-Visibility-space gridder for spectral cubes.
+Visibility-space gridder for spectral cubes. Note: under active development.
