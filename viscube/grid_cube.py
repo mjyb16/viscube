@@ -294,3 +294,234 @@ def grid_cube_all_stats(
             np.flip(np.asarray(counts),  axis=1),
             u_edges, v_edges)
 
+def _make_w_edges(
+    ww: np.ndarray,
+    w_bins: Union[int, np.ndarray],
+    *,
+    w_range: Optional[Tuple[float, float]] = None,
+    w_abs: bool = False,
+) -> np.ndarray:
+    """
+    Create w bin edges.
+
+    Parameters
+    ----------
+    ww : ndarray
+        Full w array used to determine default range.
+    w_bins : int or ndarray
+        If int, number of uniform bins in w. If ndarray, explicit bin edges.
+    w_range : (min, max), optional
+        Range for uniform bins. If None, uses data min/max (after abs if w_abs=True).
+    w_abs : bool
+        If True, bins |w| instead of w.
+
+    Returns
+    -------
+    w_edges : ndarray, shape (Nw+1,)
+    """
+    wvals = np.asarray(ww, dtype=float)
+    if w_abs:
+        wvals = np.abs(wvals)
+
+    if isinstance(w_bins, np.ndarray):
+        w_edges = np.asarray(w_bins, dtype=float)
+        if w_edges.ndim != 1 or w_edges.size < 2:
+            raise ValueError("If w_bins is an array, it must be 1D with length >= 2 (bin edges).")
+        if not np.all(np.isfinite(w_edges)):
+            raise ValueError("w bin edges contain non-finite values.")
+        if np.any(np.diff(w_edges) <= 0):
+            raise ValueError("w bin edges must be strictly increasing.")
+        return w_edges
+
+    # integer number of bins
+    n_w = int(w_bins)
+    if n_w <= 0:
+        raise ValueError("If w_bins is an int, it must be >= 1.")
+
+    if w_range is None:
+        wmin = float(np.nanmin(wvals))
+        wmax = float(np.nanmax(wvals))
+    else:
+        wmin, wmax = map(float, w_range)
+
+    if not np.isfinite(wmin) or not np.isfinite(wmax):
+        raise ValueError("w range contains non-finite values.")
+    if wmax <= wmin:
+        raise ValueError(f"Invalid w range: max ({wmax}) must be > min ({wmin}).")
+
+    return np.linspace(wmin, wmax, n_w + 1, dtype=float)
+
+
+def grid_cube_all_stats_wbinned(
+    *,
+    # Required observational inputs:
+    frequencies: np.ndarray,  # kept for API symmetry; unused here
+    uu: np.ndarray,
+    vv: np.ndarray,
+    ww: np.ndarray,
+    vis_re: np.ndarray,
+    vis_imag: np.ndarray,
+    weight: np.ndarray,
+    # Grid config:
+    npix: int = 501,
+    pad_uv: float = 0.0,
+    # W-binning config:
+    w_bins: Union[int, np.ndarray] = 8,  # int => uniform bins; ndarray => explicit edges
+    w_range: Optional[Tuple[float, float]] = None,
+    w_abs: bool = False,
+    # Window config (choose either window_name OR pass a ready-made window_fn):
+    window_name: Optional[str] = "kaiser_bessel",
+    window_kwargs: Optional[dict] = None,
+    window_fn: Optional[Callable[[ArrayLike, float], np.ndarray]] = None,
+    # KD-tree config:
+    p_metric: int = 1,
+    # std-only expansion controls passed into bin_data
+    std_workers: int = 6,
+    std_min_effective: int = 5,
+    std_expand_step: float = 0.1,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Like `grid_cube_all_stats`, but additionally bins visibilities in w and grids in uv per w-bin.
+
+    Outputs are 4D arrays with shape (F, Nw, Nu, Nv), where:
+      F  = number of channels
+      Nw = number of w-bins
+      Nu, Nv = uv grid size
+
+    Parameters
+    ----------
+    ww : ndarray
+        W coordinates, same shape as uu/vv (typically (F, N) per channel).
+    w_bins : int or ndarray
+        If int, choose that many *uniform* bins between w_range (or data min/max).
+        If ndarray, provide explicit bin edges.
+    w_range : (min, max), optional
+        Optional range override for uniform bins.
+    w_abs : bool
+        If True, bin |w| instead of w.
+
+    Returns
+    -------
+    mean_re, mean_im, std_re, std_im, counts, u_edges, v_edges, w_edges
+        mean/std/counts have shape (F, Nw, Nu, Nv).
+        u_edges, v_edges are 1D edges; w_edges are 1D bin edges.
+    """
+    # ---- basic shape checks (minimal, but guards common mistakes)
+    if uu.shape != vv.shape or uu.shape != ww.shape:
+        raise ValueError(f"uu, vv, ww must have the same shape. Got uu={uu.shape}, vv={vv.shape}, ww={ww.shape}.")
+    if vis_re.shape != uu.shape or vis_imag.shape != uu.shape or weight.shape != uu.shape:
+        raise ValueError("vis_re, vis_imag, weight must match uu/vv/ww shape.")
+
+    # 1) Build uv grid (pixel_size == delta_u)
+    u_edges, v_edges, delta_u, trunc_r = make_uv_grid(uu, vv, npix=npix, pad_uv=pad_uv)
+    centers = build_grid_centers(u_edges, v_edges)
+
+    # 2) Build w edges
+    w_edges = _make_w_edges(ww, w_bins, w_range=w_range, w_abs=w_abs)
+    Nw = len(w_edges) - 1
+
+    # 3) Build/bind window callable
+    if window_fn is not None:
+        window = _bind_window(window_fn, pixel_size=delta_u, window_kwargs=window_kwargs)
+    else:
+        if window_name is None:
+            raise ValueError("Provide either window_name or a ready-made window_fn.")
+        window = _window_from_name(window_name, pixel_size=delta_u, window_kwargs=window_kwargs)
+
+    # 4) Allocate outputs
+    F = uu.shape[0]
+    Nu = len(u_edges) - 1
+    Nv = len(v_edges) - 1
+
+    mean_re = np.zeros((F, Nw, Nu, Nv), dtype=np.float64)
+    std_re  = np.zeros((F, Nw, Nu, Nv), dtype=np.float64)
+    mean_im = np.zeros((F, Nw, Nu, Nv), dtype=np.float64)
+    std_im  = np.zeros((F, Nw, Nu, Nv), dtype=np.float64)
+    counts  = np.zeros((F, Nw, Nu, Nv), dtype=np.float64)
+
+    # 5) Loop channels; inside, loop w-bins
+    pbar = tqdm(range(F), unit="channel")
+    for i in pbar:
+        wvals = ww[i].ravel().astype(float)
+        if w_abs:
+            wvals = np.abs(wvals)
+
+        # Bin assignment: -1 outside range; we'll ignore those points
+        wbin = np.digitize(wvals, w_edges, right=False) - 1  # 0..Nw-1 expected
+        valid = (wbin >= 0) & (wbin < Nw)
+
+        # For postfix info
+        n_coarse_re_total = 0
+        n_coarse_im_total = 0
+
+        # Pre-ravel shared arrays (avoids repeated ravel)
+        u_all  = uu[i].ravel()
+        v_all  = vv[i].ravel()
+        re_all = vis_re[i].ravel()
+        im_all = vis_imag[i].ravel()
+        wgt_all = weight[i].ravel()
+
+        for b in range(Nw):
+            sel = valid & (wbin == b)
+            if not np.any(sel):
+                continue
+
+            u_b = u_all[sel]
+            v_b = v_all[sel]
+            re_b = re_all[sel]
+            im_b = im_all[sel]
+            wgt_b = wgt_all[sel]
+
+            # Build KD structures *for this w-bin subset*
+            uv_tree, grid_tree, pairs = precompute_pairs(u_b, v_b, centers, trunc_r, p_metric=p_metric)
+
+            # mean (Re/Im)
+            vb_re = bin_data(u_b, v_b, re_b, wgt_b, (u_edges, v_edges),
+                             window, trunc_r, uv_tree, grid_tree, pairs,
+                             statistics_fn="mean", verbose=0)
+            vb_im = bin_data(u_b, v_b, im_b, wgt_b, (u_edges, v_edges),
+                             window, trunc_r, uv_tree, grid_tree, pairs,
+                             statistics_fn="mean", verbose=0)
+
+            # std (Re/Im) + stats
+            sb_re, n_coarse_re = bin_data(u_b, v_b, re_b, wgt_b, (u_edges, v_edges),
+                                          window, trunc_r, uv_tree, grid_tree, pairs,
+                                          statistics_fn="std", verbose=0,
+                                          std_p=p_metric,
+                                          std_workers=std_workers,
+                                          std_min_effective=std_min_effective,
+                                          std_expand_step=std_expand_step,
+                                          collect_stats=True)
+            sb_im, n_coarse_im = bin_data(u_b, v_b, im_b, wgt_b, (u_edges, v_edges),
+                                          window, trunc_r, uv_tree, grid_tree, pairs,
+                                          statistics_fn="std", verbose=0,
+                                          std_p=p_metric,
+                                          std_workers=std_workers,
+                                          std_min_effective=std_min_effective,
+                                          std_expand_step=std_expand_step,
+                                          collect_stats=True)
+
+            # counts
+            cnt = bin_data(u_b, v_b, re_b, wgt_b, (u_edges, v_edges),
+                           window, trunc_r, uv_tree, grid_tree, pairs,
+                           statistics_fn="count", verbose=0)
+
+            mean_re[i, b] = vb_re
+            mean_im[i, b] = vb_im
+            std_re[i, b]  = sb_re
+            std_im[i, b]  = sb_im
+            counts[i, b]  = cnt
+
+            n_coarse_re_total += int(n_coarse_re)
+            n_coarse_im_total += int(n_coarse_im)
+
+        pbar.set_postfix(w_bins=Nw, coarse_std_re=int(n_coarse_re_total), coarse_std_im=int(n_coarse_im_total))
+
+    # 6) Flip u-axis (Nu dimension) to match your NPZ saving convention
+    return (np.flip(np.asarray(mean_re), axis=2),
+            np.flip(np.asarray(mean_im), axis=2),
+            np.flip(np.asarray(std_re),  axis=2),
+            np.flip(np.asarray(std_im),  axis=2),
+            np.flip(np.asarray(counts),  axis=2),
+            u_edges, v_edges, w_edges)
+
