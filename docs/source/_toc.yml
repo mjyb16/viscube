@@ -5,7 +5,11 @@ format: jb-book
 root: intro
 chapters:
   - file: install
-  - file: statistics
-  - file: notebooks/example_casa
-  - file: notebooks/xradio_uvw_continuum
+  - file: notebooks/example_basic
+  - file: extracting_ms_to_py
+  sections:
+      - file: notebooks/casa_io_basic
+      - file: notebooks/combining_low_high_res_casa
+      - file: notebooks/xradio_uvw_continuum
+    - file: statistics
   - file: api.rst
