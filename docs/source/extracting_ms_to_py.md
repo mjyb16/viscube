@@ -8,9 +8,9 @@ One of the critical preprocessing steps one must take in order to use VisCube is
 
 Of these, option 1 is the least flexible, so I do not include instructions on how to do it. 
 
-For option 2, see the [intro tutorial on extracting data with CASA](https://viscube.readthedocs.io/en/latest/extracting_ms_to_py/casa_io_basic.html) as well as the [tutorial on combining multiple observations with CASA](https://viscube.readthedocs.io/en/latest/extracting_ms_to_py/combining_low_high_res_casa.html). 
+For option 2, see the [intro tutorial on extracting data with CASA](https://viscube.readthedocs.io/en/latest/notebooks/casa_io_basic.html) as well as the [tutorial on combining multiple observations with CASA](https://viscube.readthedocs.io/en/latest/notebooks/combining_low_high_res_casa.html). 
 
-For an example of option 3, see the [intro tutorial on XRADIO with VisCube](https://viscube.readthedocs.io/en/latest/extracting_ms_to_py/xradio_uvw_continuum.html). 
+For an example of option 3, see the [intro tutorial on XRADIO with VisCube](https://viscube.readthedocs.io/en/latest/notebooks/xradio_uvw_continuum.html). 
 
 
 
