@@ -6,3 +6,5 @@ root: intro
 chapters:
   - file: install
   - file: notebooks/example_casa
+  - file: notebooks/xradio_uvw_continuum
+  - file: api.rst
