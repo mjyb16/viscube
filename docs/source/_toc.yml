@@ -7,7 +7,7 @@ chapters:
   - file: install
   - file: notebooks/example_basic
   - file: extracting_ms_to_py
-  sections:
+    sections:
       - file: notebooks/casa_io_basic
       - file: notebooks/combining_low_high_res_casa
       - file: notebooks/xradio_uvw_continuum
