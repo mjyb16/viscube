@@ -9,3 +9,5 @@ VisCube is a visibility-space gridder for radio interferometry datasets. It has 
 3. Built natively in Python using numpy
 
 The name VisCube is a nod to [VisRead](https://mpol-dev.github.io/visread/), a package documenting how to load data from Measurement Sets into memory. The CASA-based I/O procedures described in this documentation (see [here](https://viscube.readthedocs.io/en/latest/extracting_ms_to_py.html)) build on the VisRead tutorials, to which I owe a large chunk of my CASA knowledge. 
+
+WARNING: DOCUMENTATION AND SOURCE CODE UNDER CONSTRUCTION. Docs are incomplete and breaking changes to the API may still occur (albeit rarely). 
