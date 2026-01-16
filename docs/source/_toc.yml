@@ -11,5 +11,5 @@ chapters:
       - file: notebooks/casa_io_basic
       - file: notebooks/combining_low_high_res_casa
       - file: notebooks/xradio_uvw_continuum
-    - file: statistics
+  - file: statistics
   - file: api.rst
