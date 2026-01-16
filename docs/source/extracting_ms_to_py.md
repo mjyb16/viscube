@@ -12,4 +12,4 @@ For option 2, see the [intro tutorial on extracting data with CASA](https://visc
 
 For an example of option 3, see the [intro tutorial on XRADIO with VisCube](https://viscube.readthedocs.io/en/latest/notebooks/xradio_uvw_continuum.html). 
 
-##### For all of these tutorials, I assume you have a calibrated measurement set lying around...if you do not, you can download a measurement set from the ALMA archive and follow the instructions on calibration/preprocessing in CASA using the ALMA pipeline and various CASA tasks (for spectral line data, you will probably want to learn about uvcontsub and mstransform). 
+**For all of these tutorials, I assume you have a calibrated measurement set lying around...if you do not, you can download a measurement set from the ALMA archive and follow the instructions on calibration/preprocessing in CASA using the ALMA pipeline and various CASA tasks (for spectral line data, you will probably want to learn about uvcontsub and mstransform).**
