@@ -9,6 +9,8 @@ chapters:
   - file: extracting_ms_to_py
     sections:
       - file: notebooks/casa_io_basic
+      - file: notebooks/casa_io_large_ms_bychan
+      - file: notebooks/casa_io_casacore_table
       - file: notebooks/combining_low_high_res_casa
       - file: notebooks/xradio_uvw_continuum
   - file: statistics
