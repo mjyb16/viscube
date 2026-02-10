@@ -2,6 +2,7 @@ import numpy as np
 from typing import Optional
 from numpy.typing import ArrayLike
 from scipy.special import i0  # Modified Bessel I0
+import sys
 
 # ---- CASA/Schwab 1984 spheroidal rational approximation coefficients ----
 _SPH_A = np.array([0.01624782, -0.05350728, 0.1464354, -0.2347118,
@@ -74,6 +75,14 @@ def kaiser_bessel_window(u: ArrayLike,
         if w0 > 0:
             w_vals = w_vals / w0
     w[mask] = w_vals
+    if np.any(w < 0):
+        print("Error: negative weights")
+        print(f"U values: {u}")
+        print(f"Center values: {center}")
+        print(f"Beta values: {beta}")
+        print(f"W values: {w}")
+        print(f"Denom values: {denom}")
+        sys.exit()
     return w
 
 
