@@ -120,15 +120,18 @@ def bin_data_w_efficient(u, v, values, weights, bins,
              uv_tree: cKDTree,
              grid_tree: cKDTree,
              pairs: Sequence[Sequence[int]],
+             delta_u: float,                          # NEW: cell size in UV units
              statistics_fn="mean",
              verbose=0,
              window_kwargs: Optional[Dict] = None,
-             # New: std-only controls (defaults preserve old behavior)
+             # std-only controls
              std_p: int = 1,
              std_workers: int = 6,
              std_min_effective: int = 5,
              std_expand_step: float = 0.1,
-             # New: return n_coarse for tqdm display when True
+             std_expand_acceleration: float = 1.5,
+             std_max_expand_cells: float = 5.0,       # NEW: replaces std_max_expand_iter
+             # return controls
              collect_stats: bool = False,
              std_no_fallback: bool = False,
              collect_fail_mask: bool = False):
@@ -139,6 +142,10 @@ def bin_data_w_efficient(u, v, values, weights, bins,
         Accepts (u_array, center). Other params captured via closure/partial.
     window_kwargs : dict, optional
         (Kept for backwards compat; not used when window_fn is already bound.)
+    delta_u : float
+        Cell size in UV units. Used to express the expansion cap in physical
+        terms: the search radius will not grow beyond
+        std_max_expand_cells * delta_u.
     std_p : int
         `p` metric for cKDTree.query_ball_point during std expansion (default 1).
     std_workers : int
@@ -146,9 +153,21 @@ def bin_data_w_efficient(u, v, values, weights, bins,
     std_min_effective : int
         Minimum effective sample count before stopping expansion (default 5).
     std_expand_step : float
-        Multiplicative radius increment per expansion step (default 0.1).
+        Initial additive radius increment per expansion step, as a fraction of
+        truncation_radius (default 0.1).
+    std_expand_acceleration : float
+        Multiplicative growth factor applied to std_expand_step each iteration.
+        Values > 1 make the search radius grow super-linearly, preventing slow
+        crawls for isolated cells (default 1.5).
+    std_max_expand_cells : float
+        Maximum search radius expressed as a multiple of delta_u. Cells whose
+        nearest neighbours all lie beyond this radius are flagged as NaN
+        (default 5.0).
     collect_stats : bool
         If True, returns (grid, n_coarse). Otherwise returns grid only.
+    collect_fail_mask : bool
+        If True, returns (grid, fail_mask) — or (grid, n_coarse, fail_mask) if
+        collect_stats is also True.
     """
     u_edges, v_edges = bins
     Nu = len(u_edges) - 1
@@ -159,13 +178,16 @@ def bin_data_w_efficient(u, v, values, weights, bins,
     if collect_fail_mask:
         fail_mask = np.zeros((Nu, Nv), dtype=bool)
 
+    max_radius = std_max_expand_cells * delta_u   # pre-compute once
+
     n_coarse = 0
+    n_expand_capped = 0
+
     for k, data_indices in enumerate(pairs):
         if not data_indices:
             continue
 
         u_center, v_center = grid_tree.data[k]
-        # 1D separable window
         wu = window_fn(u[data_indices], u_center)
         wv = window_fn(v[data_indices], v_center)
         w = weights[data_indices] * wu * wv
@@ -173,7 +195,7 @@ def bin_data_w_efficient(u, v, values, weights, bins,
             continue
 
         val = values[data_indices]
-        i, j = divmod(k, Nv)   # Nu-major ordering outside; fill grid[j, i] (unchanged)
+        i, j = divmod(k, Nv)
 
         if statistics_fn == "mean":
             grid[j, i] = np.sum(val * w) / np.sum(w)
@@ -187,35 +209,47 @@ def bin_data_w_efficient(u, v, values, weights, bins,
 
             i, j = divmod(k, Nv)
 
-            # --- NEW: no-fallback path (do NOT expand) ---
+            # --- No-fallback path: mark and move on immediately ---
             if std_no_fallback and effective < std_min_effective:
                 grid[j, i] = np.nan
                 if fail_mask is not None:
                     fail_mask[j, i] = True
                 continue
 
-            # --- Existing expansion path, but only if allowed ---
+            # --- Expansion path with acceleration + spatial cap ---
             expand = 1.0
-            if (not std_no_fallback):
+            if not std_no_fallback:
+                current_step = std_expand_step
+                hit_cap = False
+
                 while effective < std_min_effective:
-                    expand += std_expand_step
+                    expand += current_step
+                    current_step *= std_expand_acceleration
+
+                    current_radius = expand * truncation_radius
+
+                    if current_radius > max_radius:
+                        hit_cap = True
+                        break
+
                     indices = uv_tree.query_ball_point(
                         [u_center, v_center],
-                        expand * truncation_radius,
+                        current_radius,
                         p=std_p, workers=std_workers
                     )
-                    if len(indices) == 0:
-                        break
-                    val = values[indices]
-                    wu = window_fn(u[indices], u_center)
-                    wv = window_fn(v[indices], v_center)
-                    local_w = weights[indices] * wu * wv
-                    effective = (local_w > 0).sum()
+
+                    if len(indices) > 0:
+                        wu = window_fn(u[indices], u_center)
+                        wv = window_fn(v[indices], v_center)
+                        local_w = weights[indices] * wu * wv
+                        effective = (local_w > 0).sum()
 
                 if expand > 1.0:
                     n_coarse += 1
+                if hit_cap:
+                    n_expand_capped += 1
 
-            # If still insufficient (e.g., empty), mark as NaN
+            # Still insufficient after expansion: flag as NaN
             if effective < std_min_effective:
                 grid[j, i] = np.nan
                 if fail_mask is not None:
@@ -223,8 +257,6 @@ def bin_data_w_efficient(u, v, values, weights, bins,
                 continue
 
             val = values[indices]
-
-            # Effective sample size & SE of the mean (your current logic)
             imp = wu * wv
             n_eff = (imp.sum() ** 2) / (np.sum(imp**2) + 1e-12)
             mean_val = np.sum(val * local_w) / np.sum(local_w)
@@ -237,7 +269,6 @@ def bin_data_w_efficient(u, v, values, weights, bins,
         elif callable(statistics_fn):
             grid[j, i] = statistics_fn(val, w)
 
-    # `verbose` is deprecated in favor of tqdm in the caller.
     if collect_fail_mask and collect_stats:
         return grid, n_coarse, fail_mask
     if collect_fail_mask:

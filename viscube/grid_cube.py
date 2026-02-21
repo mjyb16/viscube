@@ -441,7 +441,8 @@ def grid_cube_all_stats_wbinned(
     std_workers: int = 6,
     std_min_effective: int = 5,
     std_expand_step: float = 0.1,
-    # tqdm cosmetics
+    std_expand_acceleration: float = 1.5,
+    std_max_expand_cells: float = 5.0,   # replaces std_max_expand_iter
     tqdm_ncols: int = 200,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
@@ -553,13 +554,13 @@ def grid_cube_all_stats_wbinned(
             # mean
             vb_re = bin_data_w_efficient(
                 u_b, v_b, re_b, wgt_b, (u_edges, v_edges),
-                window, trunc_r, uv_tree, grid_tree, pairs,
+                window, trunc_r, uv_tree, grid_tree, pairs, delta_u=delta_u,
                 statistics_fn="mean",
                 verbose=0
             )
             vb_im = bin_data_w_efficient(
                 u_b, v_b, im_b, wgt_b, (u_edges, v_edges),
-                window, trunc_r, uv_tree, grid_tree, pairs,
+                window, trunc_r, uv_tree, grid_tree, pairs, delta_u=delta_u,
                 statistics_fn="mean",
                 verbose=0
             )
@@ -567,7 +568,7 @@ def grid_cube_all_stats_wbinned(
             # std: NO expansion, record failures as NaN + mask
             sb_re, fail_re = bin_data_w_efficient(
                 u_b, v_b, re_b, wgt_b, (u_edges, v_edges),
-                window, trunc_r, uv_tree, grid_tree, pairs,
+                window, trunc_r, uv_tree, grid_tree, pairs, delta_u=delta_u,
                 statistics_fn="std",
                 verbose=0,
                 std_min_effective=std_min_effective,
@@ -579,7 +580,7 @@ def grid_cube_all_stats_wbinned(
             )
             sb_im, fail_im = bin_data_w_efficient(
                 u_b, v_b, im_b, wgt_b, (u_edges, v_edges),
-                window, trunc_r, uv_tree, grid_tree, pairs,
+                window, trunc_r, uv_tree, grid_tree, pairs, delta_u=delta_u,
                 statistics_fn="std",
                 verbose=0,
                 std_min_effective=std_min_effective,
@@ -592,8 +593,8 @@ def grid_cube_all_stats_wbinned(
 
             # count
             cnt = bin_data_w_efficient(
-                u_b, v_b, re_b, wgt_b, (u_edges, v_edges),
-                window, trunc_r, uv_tree, grid_tree, pairs,
+                u_b, v_b, re_b, wgt_b, (u_edges, v_edges), 
+                window, trunc_r, uv_tree, grid_tree, pairs, delta_u=delta_u,
                 statistics_fn="count",
                 verbose=0
             )
@@ -645,7 +646,7 @@ def grid_cube_all_stats_wbinned(
                 tqdm.write(f"[Ch {i+1}/{F}]   Pass B — computing UV std (re) ...")
                 std_uv_re_noexp, fail_uv_re = bin_data_w_efficient(
                     u_all, v_all, re_all, wgt_all, (u_edges, v_edges),
-                    window, trunc_r, uv_tree_all, grid_tree_all, pairs_all,
+                    window, trunc_r, uv_tree_all, grid_tree_all, pairs_all, delta_u=delta_u,
                     statistics_fn="std",
                     verbose=0,
                     std_min_effective=std_min_effective,
@@ -676,7 +677,7 @@ def grid_cube_all_stats_wbinned(
                 tqdm.write(f"[Ch {i+1}/{F}]   Pass B — computing UV std (im) ...")
                 std_uv_im_noexp, fail_uv_im = bin_data_w_efficient(
                     u_all, v_all, im_all, wgt_all, (u_edges, v_edges),
-                    window, trunc_r, uv_tree_all, grid_tree_all, pairs_all,
+                    window, trunc_r, uv_tree_all, grid_tree_all, pairs_all, delta_u=delta_u,
                     statistics_fn="std",
                     verbose=0,
                     std_min_effective=std_min_effective,
@@ -724,13 +725,16 @@ def grid_cube_all_stats_wbinned(
                 std_uv_re_exp, _ncoarse_re = bin_data_w_efficient(
                     u_all, v_all, re_all, wgt_all, (u_edges, v_edges),
                     window, trunc_r, uv_tree_all, grid_tree_all, pairs_all,
+                    delta_u=delta_u,                               # NEW
                     statistics_fn="std",
                     verbose=0,
                     std_min_effective=std_min_effective,
                     std_workers=std_workers,
                     std_p=std_p,
                     std_expand_step=std_expand_step,
-                    std_no_fallback=False,   # expansion enabled
+                    std_expand_acceleration=std_expand_acceleration,
+                    std_max_expand_cells=std_max_expand_cells,     # NEW
+                    std_no_fallback=False,
                     collect_stats=True,
                 )
                 filled_re_C = 0
@@ -756,12 +760,15 @@ def grid_cube_all_stats_wbinned(
                 std_uv_im_exp, _ncoarse_im = bin_data_w_efficient(
                     u_all, v_all, im_all, wgt_all, (u_edges, v_edges),
                     window, trunc_r, uv_tree_all, grid_tree_all, pairs_all,
+                    delta_u=delta_u,                               # NEW
                     statistics_fn="std",
                     verbose=0,
                     std_min_effective=std_min_effective,
                     std_workers=std_workers,
                     std_p=std_p,
                     std_expand_step=std_expand_step,
+                    std_expand_acceleration=std_expand_acceleration,
+                    std_max_expand_cells=std_max_expand_cells,     # NEW
                     std_no_fallback=False,
                     collect_stats=True,
                 )
