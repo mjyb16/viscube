@@ -21,49 +21,8 @@ from .windows import (
 # Low-level utilities
 # -----------------------
 
+
 def load_and_mask(
-    frequencies: np.ndarray,
-    uu: np.ndarray,
-    vv: np.ndarray,
-    vis: np.ndarray,
-    weight: np.ndarray,
-    mask: np.ndarray,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Apply per-channel mask and compact arrays. 
-    Returns frequencies, u0, v0, vis0, w0.
-    """
-    F = len(frequencies)
-    Nmasked = int(mask[0].sum())
-    u0 = np.zeros((F, Nmasked), dtype=np.float64)
-    v0 = np.zeros((F, Nmasked), dtype=np.float64)
-    vis0 = np.zeros((F, Nmasked), dtype=np.complex128)
-    w0 = np.zeros((F, Nmasked), dtype=np.float64)
-    for i in range(F):
-        mi = mask[i]
-        u0[i] = uu[i][mi]
-        v0[i] = vv[i][mi]
-        vis0[i] = vis[i][mi]
-        w0[i] = weight[i][mi]
-    return frequencies, u0, v0, vis0, w0
-
-
-def hermitian_augment(
-    u0: np.ndarray, v0: np.ndarray, vis0: np.ndarray, w0: np.ndarray
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """
-    (u, v, Re, Im, w) -> concat with (-u, -v, +Re, -Im, w)
-    Returns uu, vv, vis_re, vis_imag, w
-    """
-    uu = np.concatenate([u0, -u0], axis=1)
-    vv = np.concatenate([v0, -v0], axis=1)
-    vis_re = np.concatenate([vis0.real, vis0.real], axis=1)
-    vis_imag = np.concatenate([vis0.imag, -vis0.imag], axis=1)
-    w = np.concatenate([w0, w0], axis=1)
-    return uu, vv, vis_re, vis_imag, w
-
-
-def load_and_mask_with_sigma(
     frequencies: np.ndarray,
     uu: np.ndarray,
     vv: np.ndarray,
@@ -108,7 +67,7 @@ def load_and_mask_with_sigma(
     return frequencies, u0, v0, vis0, w0, s_re0, s_im0
 
 
-def hermitian_augment_with_sigma(
+def hermitian_augment(
     u0: np.ndarray,
     v0: np.ndarray,
     vis0: np.ndarray,
@@ -349,105 +308,8 @@ def _window_from_name(name: str,
     return _bind_window(base, pixel_size=pixel_size, window_kwargs=window_kwargs)
 
 
+
 def grid_cube_all_stats(
-    *,
-    frequencies: np.ndarray,
-    uu: np.ndarray,
-    vv: np.ndarray,
-    vis_re: np.ndarray,
-    vis_imag: np.ndarray,
-    weight: np.ndarray,
-    npix: int = 501,
-    fov_arcsec: Optional[float] = None,          # NEW
-    pad_uv: float = 0.0,
-    window_name: Optional[str] = "kaiser_bessel",
-    window_kwargs: Optional[dict] = None,
-    window_fn: Optional[Callable[[ArrayLike, float], np.ndarray]] = None,
-    p_metric: int = 1,
-    std_p: int = 1,
-    std_workers: int = 6,
-    std_min_effective: int = 5,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-
-    u_edges, v_edges, delta_u, trunc_r = make_uv_grid(
-        uu, vv, npix=npix, pad_uv=pad_uv, fov_arcsec=fov_arcsec, warn_crop=True
-    )
-    centers = build_grid_centers(u_edges, v_edges)
-
-    if window_fn is not None:
-        window = _bind_window(window_fn, pixel_size=delta_u, window_kwargs=window_kwargs)
-    else:
-        if window_name is None:
-            raise ValueError("Provide either window_name or a ready-made window_fn.")
-        window = _window_from_name(window_name, pixel_size=delta_u, window_kwargs=window_kwargs)
-
-    F = uu.shape[0]
-    Nu = len(u_edges) - 1
-    Nv = len(v_edges) - 1
-    mean_re = np.zeros((F, Nu, Nv), dtype=np.float64)
-    std_re  = np.zeros((F, Nu, Nv), dtype=np.float64)
-    mean_im = np.zeros((F, Nu, Nv), dtype=np.float64)
-    std_im  = np.zeros((F, Nu, Nv), dtype=np.float64)
-    counts  = np.zeros((F, Nu, Nv), dtype=np.float64)
-
-    pbar = tqdm(range(F), unit="channel")
-    for i in pbar:
-        uv_tree, grid_tree, pairs = precompute_pairs(uu[i], vv[i], centers, trunc_r, p_metric=p_metric)
-
-        vb_re = bin_data(
-            uu[i], vv[i], vis_re[i], weight[i], (u_edges, v_edges),
-            window, trunc_r, uv_tree, grid_tree, pairs,
-            statistics_fn="mean", verbose=0
-        )
-        vb_im = bin_data(
-            uu[i], vv[i], vis_imag[i], weight[i], (u_edges, v_edges),
-            window, trunc_r, uv_tree, grid_tree, pairs,
-            statistics_fn="mean", verbose=0
-        )
-
-        # std (Re/Im) + stats
-        sb_re, stats_re = bin_data(
-            uu[i], vv[i], vis_re[i], weight[i], (u_edges, v_edges),
-            window, trunc_r, uv_tree, grid_tree, pairs,
-            statistics_fn="std", verbose=0,
-            std_min_effective=std_min_effective, std_workers = std_workers, std_p = std_p,
-            collect_stats=True
-        )
-        sb_im, stats_im = bin_data(
-            uu[i], vv[i], vis_imag[i], weight[i], (u_edges, v_edges),
-            window, trunc_r, uv_tree, grid_tree, pairs,
-            statistics_fn="std", verbose=0,
-            std_min_effective=std_min_effective, std_workers = std_workers, std_p = std_p,
-            collect_stats=True
-        )
-
-        cnt = bin_data(
-            uu[i], vv[i], vis_re[i], weight[i], (u_edges, v_edges),
-            window, trunc_r, uv_tree, grid_tree, pairs,
-            statistics_fn="count", verbose=0
-        )
-
-        mean_re[i] = vb_re
-        mean_im[i] = vb_im
-        std_re[i]  = sb_re
-        std_im[i]  = sb_im
-        counts[i]  = cnt
-
-        pbar.set_postfix(
-            expansion_pix_re=stats_re,
-            expansion_pix_im=stats_im
-        )
-
-    return (uv_grid_to_fft_image_convention(np.asarray(mean_re)),
-            uv_grid_to_fft_image_convention(np.asarray(mean_im)),
-            uv_grid_to_fft_image_convention(np.asarray(std_re)),
-            uv_grid_to_fft_image_convention(np.asarray(std_im)),
-            uv_grid_to_fft_image_convention(np.asarray(counts)),
-            u_edges, v_edges)
-
-
-
-def grid_cube_all_stats_antenna_noise(
     *,
     frequencies: np.ndarray,
     uu: np.ndarray,
