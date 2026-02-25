@@ -9,5 +9,6 @@ from .grid_cube import (
     hermitian_augment,
     make_uv_grid,
     build_grid_centers,
-    sigma_by_baseline_scan_time_diff
 )
+
+from .sigma_per_baseline import sigma_by_baseline_scan_time_diff

@@ -1,6 +1,5 @@
 import numpy as np
 from typing import Optional
-from numpy.typing import ArrayLike
 from scipy.special import i0  # Modified Bessel I0
 import sys
 
@@ -23,7 +22,7 @@ def _spheroid_vec(eta: np.ndarray) -> np.ndarray:
     return out
 
 
-def kaiser_bessel_window(u: ArrayLike,
+def kaiser_bessel_window(u,
                          center: float,
                          *,
                          pixel_size: float = 0.015,
@@ -86,7 +85,7 @@ def kaiser_bessel_window(u: ArrayLike,
     return w
 
 
-def casa_pswf_window(u: ArrayLike,
+def casa_pswf_window(u,
                      center: float,
                      *,
                      pixel_size: float = 0.015,
@@ -123,14 +122,14 @@ def casa_pswf_window(u: ArrayLike,
     return w
 
 
-def pillbox_window(u: ArrayLike, center: float, pixel_size: float = 0.015, m: int = 1):
+def pillbox_window(u, center: float, pixel_size: float = 0.015, m: int = 1):
     """Boxcar window with total width m * pixel_size."""
     u = np.asarray(u, dtype=float)
     half = 0.5 * m * pixel_size
     return (np.abs(u - center) <= half).astype(float)
 
 
-def sinc_window(u: ArrayLike, center: float, pixel_size: float = 0.015, m: int = 1):
+def sinc_window(u, center: float, pixel_size: float = 0.015, m: int = 1):
     """Sinc window truncated by m * pixel_size (soft truncation)."""
     u = np.asarray(u, dtype=float)
     # Use normalized sinc: np.sinc(x) = sin(pi x)/(pi x)

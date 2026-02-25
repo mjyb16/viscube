@@ -1,15 +1,13 @@
-from __future__ import annotations
 import warnings
 from typing import Callable, Tuple, Sequence, Optional, Union
 import numpy as np
-from numpy.typing import ArrayLike
 from scipy.spatial import cKDTree
 import inspect
 from tqdm import tqdm
 from functools import wraps
 
 # Use your existing implementations
-from .gridder import bin_data, bin_data_w_efficient, bin_data_antenna_noise
+from .gridder import bin_data
 from .windows import (
     kaiser_bessel_window,
     casa_pswf_window,
@@ -227,8 +225,8 @@ def grid_channel(
     w_i: np.ndarray,
     u_edges: np.ndarray,
     v_edges: np.ndarray,
-    window_fn: Callable[[ArrayLike, float], np.ndarray],
-    truncation_radius: float,
+    window_fn,
+    truncation_radius,
     uv_tree: cKDTree,
     grid_tree: cKDTree,
     pairs: Sequence[Sequence[int]],
@@ -288,7 +286,7 @@ def _window_from_name(name: str,
                       *,
                       pixel_size: float,
                       window_kwargs: Optional[dict] = None
-                      ) -> Callable[[ArrayLike, float], np.ndarray]:
+                      ):
     """
     Build a window(u, center) callable from a string and a kwargs dict.
     No assumptions about which kwargs exist; only forwards what the window accepts.
@@ -324,7 +322,7 @@ def grid_cube_all_stats(
     pad_uv: float = 0.0,
     window_name: Optional[str] = "kaiser_bessel",
     window_kwargs: Optional[dict] = None,
-    window_fn: Optional[Callable[[ArrayLike, float], np.ndarray]] = None,
+    window_fn = None,
     p_metric: int = 1,
     std_p: int = 1,
     std_workers: int = 6,
@@ -361,19 +359,19 @@ def grid_cube_all_stats(
         )
 
         # Means
-        vb_re = bin_data_antenna_noise(
+        vb_re = bin_data(
             uu[i], vv[i], vis_re[i], weight[i], None, (u_edges, v_edges),
             window, trunc_r, uv_tree, grid_tree, pairs,
             statistics_fn="mean", verbose=0
         )
-        vb_im = bin_data_antenna_noise(
+        vb_im = bin_data(
             uu[i], vv[i], vis_imag[i], weight[i], None, (u_edges, v_edges),
             window, trunc_r, uv_tree, grid_tree, pairs,
             statistics_fn="mean", verbose=0
         )
 
         # Hybrid std (empirical normal pixels, propagated fallback on low-info)
-        sb_re, stats_re = bin_data_antenna_noise(
+        sb_re, stats_re = bin_data(
             uu[i], vv[i], vis_re[i], weight[i], invvar_group_re[i], (u_edges, v_edges),
             window, trunc_r, uv_tree, grid_tree, pairs,
             statistics_fn="std", verbose=0,
@@ -381,7 +379,7 @@ def grid_cube_all_stats(
             std_workers=std_workers, std_p=std_p,
             collect_stats=True
         )
-        sb_im, stats_im = bin_data_antenna_noise(
+        sb_im, stats_im = bin_data(
             uu[i], vv[i], vis_imag[i], weight[i], invvar_group_im[i], (u_edges, v_edges),
             window, trunc_r, uv_tree, grid_tree, pairs,
             statistics_fn="std", verbose=0,
@@ -391,7 +389,7 @@ def grid_cube_all_stats(
         )
 
         # Counts
-        cnt = bin_data_antenna_noise(
+        cnt = bin_data(
             uu[i], vv[i], vis_re[i], weight[i], None, (u_edges, v_edges),
             window, trunc_r, uv_tree, grid_tree, pairs,
             statistics_fn="count", verbose=0
@@ -485,6 +483,8 @@ def grid_cube_all_stats_wbinned(
     vis_re: np.ndarray,
     vis_imag: np.ndarray,
     weight: np.ndarray,
+    invvar_group_re: np.ndarray,   # NEW: same shape as vis_re
+    invvar_group_im: np.ndarray,   # NEW: same shape as vis_imag
     npix: int = 501,
     fov_arcsec: Optional[float] = None,
     pad_uv: float = 0.0,
@@ -493,39 +493,49 @@ def grid_cube_all_stats_wbinned(
     w_abs: bool = False,
     window_name: Optional[str] = "kaiser_bessel",
     window_kwargs: Optional[dict] = None,
-    window_fn: Optional[Callable[[ArrayLike, float], np.ndarray]] = None,
+    window_fn: Optional[Callable] = None,
     p_metric: int = 1,
-    # Std controls
+    # Std controls (kept aligned with bin_data)
     std_p: int = 1,
     std_workers: int = 6,
     std_min_effective: int = 5,
-    std_expand_step: float = 0.1,
-    std_expand_acceleration: float = 1.5,
-    std_max_expand_cells: float = 5.0,   # replaces std_max_expand_iter
     tqdm_ncols: int = 200,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+) -> Tuple[
+    np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray,
+    np.ndarray, np.ndarray, np.ndarray
+]:
     """
-    Grid complex visibilities into UV pixels, also computing per-pixel uncertainty estimates,
-    but with a staged fallback strategy for std:
+    Grid complex visibilities into UVW-binned UV pixels using `bin_data`.
 
-      Pass A (per w-bin): std is computed WITHOUT expansion. Cells with insufficient effective
-        samples are marked as NaN and recorded in a failure mask.
+    Two-pass std logic per (channel, w-bin):
+      Pass A:
+        - mean/count as usual
+        - std via empirical within-cell scatter -> SE(mean)
+        - low-info cells (< std_min_effective kernel-supported samples) become NaN
+          because invvar_group=None in this pass
+      Pass B:
+        - recompute std using invvar_group (same UVW cell geometry)
+        - fill only NaNs from Pass A
 
-      Pass B (collapse W -> UV): compute UV-only std over ALL points in the channel (all w),
-        again WITHOUT expansion, and use it to fill failed cells across all w-bins.
-
-      Pass C (expand remaining): for cells still missing after Pass B, compute UV-only std WITH
-        expansion enabled (incremental search radius), and fill remaining NaNs.
-
+    Notes
+    -----
+    - No flattening over w
+    - No UV-only fallback
+    - No expansion radius / slow Pass C
     """
 
     # -----------------------
     # Basic validation
     # -----------------------
     if uu.shape != vv.shape or uu.shape != ww.shape:
-        raise ValueError(f"uu, vv, ww must have the same shape. Got uu={uu.shape}, vv={vv.shape}, ww={ww.shape}.")
+        raise ValueError(
+            f"uu, vv, ww must have the same shape. "
+            f"Got uu={uu.shape}, vv={vv.shape}, ww={ww.shape}."
+        )
     if vis_re.shape != uu.shape or vis_imag.shape != uu.shape or weight.shape != uu.shape:
         raise ValueError("vis_re, vis_imag, weight must match uu/vv/ww shape.")
+    if invvar_group_re.shape != uu.shape or invvar_group_im.shape != uu.shape:
+        raise ValueError("invvar_group_re and invvar_group_im must match uu/vv/ww shape.")
     if uu.ndim < 2:
         raise ValueError("Expected uu/vv/ww to be shaped (F, ...). Got ndim < 2.")
 
@@ -547,15 +557,15 @@ def grid_cube_all_stats_wbinned(
             raise ValueError("Provide either window_name or a ready-made window_fn.")
         window = _window_from_name(window_name, pixel_size=delta_u, window_kwargs=window_kwargs)
 
-    # Dimensions (kept as in your snippet)
+    # Dimensions
     F = uu.shape[0]
     Nu = len(u_edges) - 1
     Nv = len(v_edges) - 1
 
     mean_re = np.zeros((F, Nw, Nu, Nv), dtype=np.float64)
-    std_re  = np.zeros((F, Nw, Nu, Nv), dtype=np.float64)
+    std_re  = np.full((F, Nw, Nu, Nv), np.nan, dtype=np.float64)
     mean_im = np.zeros((F, Nw, Nu, Nv), dtype=np.float64)
-    std_im  = np.zeros((F, Nw, Nu, Nv), dtype=np.float64)
+    std_im  = np.full((F, Nw, Nu, Nv), np.nan, dtype=np.float64)
     counts  = np.zeros((F, Nw, Nu, Nv), dtype=np.float64)
 
     # -----------------------
@@ -571,17 +581,24 @@ def grid_cube_all_stats_wbinned(
         re_all  = vis_re[i].ravel()
         im_all  = vis_imag[i].ravel()
         wgt_all = weight[i].ravel()
+        invv_re_all = invvar_group_re[i].ravel()
+        invv_im_all = invvar_group_im[i].ravel()
 
         if w_abs:
             wvals = np.abs(wvals)
 
         # Assign each datum to a w-bin
+        # right=False means bins are [edge_k, edge_{k+1})
         wbin = np.digitize(wvals, w_edges, right=False) - 1
         valid = (wbin >= 0) & (wbin < Nw)
 
-        # Track which cells failed per w-bin (for later filling)
-        fail_re_bins = np.zeros((Nw, Nu, Nv), dtype=bool)
-        fail_im_bins = np.zeros((Nw, Nu, Nv), dtype=bool)
+        # Channel diagnostics
+        ch_fallback_re_A = 0  # low-info cells in Pass A (empirical-only)
+        ch_fallback_im_A = 0
+        ch_filled_re_B = 0    # cells filled in Pass B via invvar
+        ch_filled_im_B = 0
+        ch_nan_re = 0         # remaining NaNs after Pass B
+        ch_nan_im = 0
 
         wbar = tqdm(
             range(Nw),
@@ -591,9 +608,6 @@ def grid_cube_all_stats_wbinned(
             ncols=tqdm_ncols,
         )
 
-        # -----------------------
-        # Pass A: per w-bin gridding (std without expansion)
-        # -----------------------
         for b in wbar:
             sel = valid & (wbin == b)
             if not np.any(sel):
@@ -605,265 +619,98 @@ def grid_cube_all_stats_wbinned(
             re_b  = re_all[sel]
             im_b  = im_all[sel]
             wgt_b = wgt_all[sel]
+            invv_re_b = invv_re_all[sel]
+            invv_im_b = invv_im_all[sel]
 
+            # Precompute geometry for this UVW subset
             uv_tree, grid_tree, pairs = precompute_pairs(
                 u_b, v_b, centers, trunc_r, p_metric=p_metric
             )
 
-            # mean
-            vb_re = bin_data_w_efficient(
-                u_b, v_b, re_b, wgt_b, (u_edges, v_edges),
-                window, trunc_r, uv_tree, grid_tree, pairs, delta_u=delta_u,
-                statistics_fn="mean",
-                verbose=0
+            # -----------------------
+            # Pass A: regular UVW gridding (means/counts unchanged)
+            # -----------------------
+            vb_re = bin_data(
+                u_b, v_b, re_b, wgt_b, None, (u_edges, v_edges),
+                window, trunc_r, uv_tree, grid_tree, pairs,
+                statistics_fn="mean", verbose=0
             )
-            vb_im = bin_data_w_efficient(
-                u_b, v_b, im_b, wgt_b, (u_edges, v_edges),
-                window, trunc_r, uv_tree, grid_tree, pairs, delta_u=delta_u,
-                statistics_fn="mean",
-                verbose=0
+            vb_im = bin_data(
+                u_b, v_b, im_b, wgt_b, None, (u_edges, v_edges),
+                window, trunc_r, uv_tree, grid_tree, pairs,
+                statistics_fn="mean", verbose=0
+            )
+            cnt = bin_data(
+                u_b, v_b, re_b, wgt_b, None, (u_edges, v_edges),
+                window, trunc_r, uv_tree, grid_tree, pairs,
+                statistics_fn="count", verbose=0
             )
 
-            # std: NO expansion, record failures as NaN + mask
-            sb_re, fail_re = bin_data_w_efficient(
-                u_b, v_b, re_b, wgt_b, (u_edges, v_edges),
-                window, trunc_r, uv_tree, grid_tree, pairs, delta_u=delta_u,
-                statistics_fn="std",
-                verbose=0,
+            sb_re, stats_re = bin_data(
+                u_b, v_b, re_b, wgt_b, invv_re_b, (u_edges, v_edges),
+                window, trunc_r, uv_tree, grid_tree, pairs,
+                statistics_fn="std", verbose=0,
                 std_min_effective=std_min_effective,
                 std_workers=std_workers,
                 std_p=std_p,
-                std_expand_step=std_expand_step,     # unused in no-fallback but passed for API
-                std_no_fallback=True,
-                collect_fail_mask=True,
+                collect_stats=True,
             )
-            sb_im, fail_im = bin_data_w_efficient(
-                u_b, v_b, im_b, wgt_b, (u_edges, v_edges),
-                window, trunc_r, uv_tree, grid_tree, pairs, delta_u=delta_u,
-                statistics_fn="std",
-                verbose=0,
+            sb_im, stats_im = bin_data(
+                u_b, v_b, im_b, wgt_b, invv_im_b, (u_edges, v_edges),
+                window, trunc_r, uv_tree, grid_tree, pairs,
+                statistics_fn="std", verbose=0,
                 std_min_effective=std_min_effective,
                 std_workers=std_workers,
                 std_p=std_p,
-                std_expand_step=std_expand_step,
-                std_no_fallback=True,
-                collect_fail_mask=True,
+                collect_stats=True,
             )
 
-            # count
-            cnt = bin_data_w_efficient(
-                u_b, v_b, re_b, wgt_b, (u_edges, v_edges), 
-                window, trunc_r, uv_tree, grid_tree, pairs, delta_u=delta_u,
-                statistics_fn="count",
-                verbose=0
-            )
-
+            # Store
             mean_re[i, b] = vb_re
             mean_im[i, b] = vb_im
             std_re[i, b]  = sb_re
             std_im[i, b]  = sb_im
             counts[i, b]  = cnt
 
-            fail_re_bins[b] = fail_re
-            fail_im_bins[b] = fail_im
+            # Diagnostics
+            nan_re_bin = int(np.isnan(sb_re).sum())
+            nan_im_bin = int(np.isnan(sb_im).sum())
+
+            ch_fallback_re_A += int(fallback_re_A)
+            ch_fallback_im_A += int(fallback_im_A)
+            ch_filled_re_B += filled_re_B
+            ch_filled_im_B += filled_im_B
+            ch_nan_re += nan_re_bin
+            ch_nan_im += nan_im_bin
 
             wbar.set_postfix(
-                fail_std_re=int(fail_re.sum()),
-                fail_std_im=int(fail_im.sum()),
+                fallbackA_re=int(fallback_re_A),
+                fallbackA_im=int(fallback_im_A),
+                fillB_re=filled_re_B,
+                fillB_im=filled_im_B,
+                nan_re=nan_re_bin,
+                nan_im=nan_im_bin,
             )
 
-        # -----------------------
-        # Pass B/C: UV-only fallback (collapse W -> UV)
-        # -----------------------
-        any_fail_re = bool(fail_re_bins.any())
-        any_fail_im = bool(fail_im_bins.any())
+        pbar.set_postfix(
+            w_bins=Nw,
+            fallbackA_re=ch_fallback_re_A,
+            fallbackA_im=ch_fallback_im_A,
+            fillB_re=ch_filled_re_B,
+            fillB_im=ch_filled_im_B,
+            nan_re=ch_nan_re,
+            nan_im=ch_nan_im,
+        )
 
-        if any_fail_re or any_fail_im:
-            # Summarise what Pass A left behind before starting fallback passes
-            total_fail_re = int(fail_re_bins.sum())
-            total_fail_im = int(fail_im_bins.sum())
-            tqdm.write(
-                f"\n[Ch {i+1}/{F}] Pass A done. "
-                f"Failures needing fallback — re: {total_fail_re} cells, "
-                f"im: {total_fail_im} cells across {Nw} w-bins."
-            )
-
-            # Precompute UV mapping once for the full channel (all w)
-            tqdm.write(f"[Ch {i+1}/{F}] Precomputing UV pairs for full channel (all w)...")
-            uv_tree_all, grid_tree_all, pairs_all = precompute_pairs(
-                u_all, v_all, centers, trunc_r, p_metric=p_metric
-            )
-            tqdm.write(f"[Ch {i+1}/{F}] UV pairs ready.")
-
-            # ---- Pass B: UV-only std WITHOUT expansion ----
-            std_uv_re_noexp = None
-            std_uv_im_noexp = None
-
-            tqdm.write(f"[Ch {i+1}/{F}] >>> Pass B: UV-only std (no expansion) <<<")
-
-            if any_fail_re:
-                tqdm.write(f"[Ch {i+1}/{F}]   Pass B — computing UV std (re) ...")
-                std_uv_re_noexp, fail_uv_re = bin_data_w_efficient(
-                    u_all, v_all, re_all, wgt_all, (u_edges, v_edges),
-                    window, trunc_r, uv_tree_all, grid_tree_all, pairs_all, delta_u=delta_u,
-                    statistics_fn="std",
-                    verbose=0,
-                    std_min_effective=std_min_effective,
-                    std_workers=std_workers,
-                    std_p=std_p,
-                    std_expand_step=std_expand_step,
-                    std_no_fallback=True,
-                    collect_fail_mask=True,
-                )
-                # Fill all per-wbin failures using UV-only (collapsed-W) std
-                filled_re_B = 0
-                for b in range(Nw):
-                    m = fail_re_bins[b]
-                    if m.any():
-                        # Only count cells where UV std actually provided a value
-                        fillable = m & ~np.isnan(std_uv_re_noexp)
-                        std_re[i, b][m] = std_uv_re_noexp[m]
-                        filled_re_B += int(fillable.sum())
-                still_nan_re = int(np.isnan(std_re[i]).sum())
-                tqdm.write(
-                    f"[Ch {i+1}/{F}]   Pass B (re) done. "
-                    f"Filled {filled_re_B} cells. "
-                    f"Still NaN after B: {still_nan_re}. "
-                    f"UV-level failures in B: {int(fail_uv_re.sum())}."
-                )
-
-            if any_fail_im:
-                tqdm.write(f"[Ch {i+1}/{F}]   Pass B — computing UV std (im) ...")
-                std_uv_im_noexp, fail_uv_im = bin_data_w_efficient(
-                    u_all, v_all, im_all, wgt_all, (u_edges, v_edges),
-                    window, trunc_r, uv_tree_all, grid_tree_all, pairs_all, delta_u=delta_u,
-                    statistics_fn="std",
-                    verbose=0,
-                    std_min_effective=std_min_effective,
-                    std_workers=std_workers,
-                    std_p=std_p,
-                    std_expand_step=std_expand_step,
-                    std_no_fallback=True,
-                    collect_fail_mask=True,
-                )
-                filled_im_B = 0
-                for b in range(Nw):
-                    m = fail_im_bins[b]
-                    if m.any():
-                        fillable = m & ~np.isnan(std_uv_im_noexp)
-                        std_im[i, b][m] = std_uv_im_noexp[m]
-                        filled_im_B += int(fillable.sum())
-                still_nan_im = int(np.isnan(std_im[i]).sum())
-                tqdm.write(
-                    f"[Ch {i+1}/{F}]   Pass B (im) done. "
-                    f"Filled {filled_im_B} cells. "
-                    f"Still NaN after B: {still_nan_im}. "
-                    f"UV-level failures in B: {int(fail_uv_im.sum())}."
-                )
-
-            # ---- Pass C: expand ONLY remaining NaNs ----
-            remain_re = np.isnan(std_re[i]).any(axis=0) if any_fail_re else None
-            remain_im = np.isnan(std_im[i]).any(axis=0) if any_fail_im else None
-
-            need_C_re = any_fail_re and remain_re is not None and remain_re.any()
-            need_C_im = any_fail_im and remain_im is not None and remain_im.any()
-
-            if need_C_re or need_C_im:
-                tqdm.write(
-                    f"[Ch {i+1}/{F}] >>> Pass C: UV-only std WITH expansion "
-                    f"(re needs C: {need_C_re}, im needs C: {need_C_im}) <<<"
-                )
-            else:
-                tqdm.write(f"[Ch {i+1}/{F}] Pass C not needed — no remaining NaNs after Pass B.")
-
-            if need_C_re:
-                tqdm.write(
-                    f"[Ch {i+1}/{F}]   Pass C — computing expanded UV std (re) "
-                    f"for {int(remain_re.sum())} UV cells still missing ..."
-                )
-                std_uv_re_exp, _ncoarse_re = bin_data_w_efficient(
-                    u_all, v_all, re_all, wgt_all, (u_edges, v_edges),
-                    window, trunc_r, uv_tree_all, grid_tree_all, pairs_all,
-                    delta_u=delta_u,                               # NEW
-                    statistics_fn="std",
-                    verbose=0,
-                    std_min_effective=std_min_effective,
-                    std_workers=std_workers,
-                    std_p=std_p,
-                    std_expand_step=std_expand_step,
-                    std_expand_acceleration=std_expand_acceleration,
-                    std_max_expand_cells=std_max_expand_cells,     # NEW
-                    std_no_fallback=False,
-                    collect_stats=True,
-                )
-                filled_re_C = 0
-                for b in range(Nw):
-                    m = np.isnan(std_re[i, b])
-                    if m.any():
-                        fillable = m & ~np.isnan(std_uv_re_exp)
-                        std_re[i, b][m] = std_uv_re_exp[m]
-                        filled_re_C += int(fillable.sum())
-                still_nan_re_C = int(np.isnan(std_re[i]).sum())
-                tqdm.write(
-                    f"[Ch {i+1}/{F}]   Pass C (re) done. "
-                    f"Expanded cells (n_coarse): {_ncoarse_re}. "
-                    f"Filled {filled_re_C} cells. "
-                    f"Remaining NaN after C: {still_nan_re_C}."
-                )
-
-            if need_C_im:
-                tqdm.write(
-                    f"[Ch {i+1}/{F}]   Pass C — computing expanded UV std (im) "
-                    f"for {int(remain_im.sum())} UV cells still missing ..."
-                )
-                std_uv_im_exp, _ncoarse_im = bin_data_w_efficient(
-                    u_all, v_all, im_all, wgt_all, (u_edges, v_edges),
-                    window, trunc_r, uv_tree_all, grid_tree_all, pairs_all,
-                    delta_u=delta_u,                               # NEW
-                    statistics_fn="std",
-                    verbose=0,
-                    std_min_effective=std_min_effective,
-                    std_workers=std_workers,
-                    std_p=std_p,
-                    std_expand_step=std_expand_step,
-                    std_expand_acceleration=std_expand_acceleration,
-                    std_max_expand_cells=std_max_expand_cells,     # NEW
-                    std_no_fallback=False,
-                    collect_stats=True,
-                )
-                filled_im_C = 0
-                for b in range(Nw):
-                    m = np.isnan(std_im[i, b])
-                    if m.any():
-                        fillable = m & ~np.isnan(std_uv_im_exp)
-                        std_im[i, b][m] = std_uv_im_exp[m]
-                        filled_im_C += int(fillable.sum())
-                still_nan_im_C = int(np.isnan(std_im[i]).sum())
-                tqdm.write(
-                    f"[Ch {i+1}/{F}]   Pass C (im) done. "
-                    f"Expanded cells (n_coarse): {_ncoarse_im}. "
-                    f"Filled {filled_im_C} cells. "
-                    f"Remaining NaN after C: {still_nan_im_C}."
-                )
-
-            # Final per-channel summary
-            final_nan_re = int(np.isnan(std_re[i]).sum())
-            final_nan_im = int(np.isnan(std_im[i]).sum())
-            tqdm.write(
-                f"[Ch {i+1}/{F}] <<< Fallback complete. "
-                f"Final NaN count — re: {final_nan_re}, im: {final_nan_im} >>>\n"
-            )
-
-        # Channel-level postfix
-        pbar.set_postfix(w_bins=Nw)
-
-    # Keep your final axis flip behavior unchanged
-    return (uv_grid_to_fft_image_convention(np.asarray(mean_re)),
-            uv_grid_to_fft_image_convention(np.asarray(mean_im)),
-            uv_grid_to_fft_image_convention(np.asarray(std_re)),
-            uv_grid_to_fft_image_convention(np.asarray(std_im)),
-            uv_grid_to_fft_image_convention(np.asarray(counts)),
-            u_edges, v_edges, w_edges)
+    # Keep final axis-flip behavior unchanged
+    return (
+        uv_grid_to_fft_image_convention(np.asarray(mean_re)),
+        uv_grid_to_fft_image_convention(np.asarray(mean_im)),
+        uv_grid_to_fft_image_convention(np.asarray(std_re)),
+        uv_grid_to_fft_image_convention(np.asarray(std_im)),
+        uv_grid_to_fft_image_convention(np.asarray(counts)),
+        u_edges, v_edges, w_edges,
+    )
 
 
 

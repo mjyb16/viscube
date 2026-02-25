@@ -104,7 +104,7 @@ setup(
     setup_requires=["setuptools_scm"],
     packages=find_packages(exclude=["tests", "*.tests", "*.tests.*", "tests.*"]),
     package_dir={meta["name"]: os.path.join(".", meta["path"])},
-    python_requires=">=3.7",
+    python_requires=">=3.6",
     install_requires=install_requires,
     extras_require=extras_require,
     # Metadata to display on PyPI
