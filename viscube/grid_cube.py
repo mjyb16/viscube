@@ -506,22 +506,6 @@ def grid_cube_all_stats_wbinned(
 ]:
     """
     Grid complex visibilities into UVW-binned UV pixels using `bin_data`.
-
-    Two-pass std logic per (channel, w-bin):
-      Pass A:
-        - mean/count as usual
-        - std via empirical within-cell scatter -> SE(mean)
-        - low-info cells (< std_min_effective kernel-supported samples) become NaN
-          because invvar_group=None in this pass
-      Pass B:
-        - recompute std using invvar_group (same UVW cell geometry)
-        - fill only NaNs from Pass A
-
-    Notes
-    -----
-    - No flattening over w
-    - No UV-only fallback
-    - No expansion radius / slow Pass C
     """
 
     # -----------------------
@@ -593,12 +577,10 @@ def grid_cube_all_stats_wbinned(
         valid = (wbin >= 0) & (wbin < Nw)
 
         # Channel diagnostics
-        ch_fallback_re_A = 0  # low-info cells in Pass A (empirical-only)
-        ch_fallback_im_A = 0
-        ch_filled_re_B = 0    # cells filled in Pass B via invvar
-        ch_filled_im_B = 0
-        ch_nan_re = 0         # remaining NaNs after Pass B
-        ch_nan_im = 0
+        ch_fallback_re = 0   # number of UV pixels that triggered low-info fallback (Re)
+        ch_fallback_im = 0   # number of UV pixels that triggered low-info fallback (Im)
+        ch_nan_re = 0        # NaN pixels remaining (Re)
+        ch_nan_im = 0        # NaN pixels remaining (Im)
 
         wbar = tqdm(
             range(Nw),
@@ -673,31 +655,28 @@ def grid_cube_all_stats_wbinned(
             counts[i, b]  = cnt
 
             # Diagnostics
+            fallback_re_bin = int(stats_re)  # n_fallback returned by bin_data
+            fallback_im_bin = int(stats_im)
+            
             nan_re_bin = int(np.isnan(sb_re).sum())
             nan_im_bin = int(np.isnan(sb_im).sum())
-
-            ch_fallback_re_A += int(fallback_re_A)
-            ch_fallback_im_A += int(fallback_im_A)
-            ch_filled_re_B += filled_re_B
-            ch_filled_im_B += filled_im_B
+            
+            ch_fallback_re += fallback_re_bin
+            ch_fallback_im += fallback_im_bin
             ch_nan_re += nan_re_bin
             ch_nan_im += nan_im_bin
-
+            
             wbar.set_postfix(
-                fallbackA_re=int(fallback_re_A),
-                fallbackA_im=int(fallback_im_A),
-                fillB_re=filled_re_B,
-                fillB_im=filled_im_B,
+                fallback_re=fallback_re_bin,
+                fallback_im=fallback_im_bin,
                 nan_re=nan_re_bin,
                 nan_im=nan_im_bin,
             )
 
         pbar.set_postfix(
             w_bins=Nw,
-            fallbackA_re=ch_fallback_re_A,
-            fallbackA_im=ch_fallback_im_A,
-            fillB_re=ch_filled_re_B,
-            fillB_im=ch_filled_im_B,
+            fallback_re=ch_fallback_re,
+            fallback_im=ch_fallback_im,
             nan_re=ch_nan_re,
             nan_im=ch_nan_im,
         )
