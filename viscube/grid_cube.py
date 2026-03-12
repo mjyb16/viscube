@@ -327,6 +327,7 @@ def grid_cube_all_stats(
     std_p: int = 1,
     std_workers: int = 6,
     std_min_effective: int = 5,
+    n_eff_mode: str = "both"
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
 
     u_edges, v_edges, delta_u, trunc_r = make_uv_grid(
@@ -377,7 +378,7 @@ def grid_cube_all_stats(
             statistics_fn="std", verbose=0,
             std_min_effective=std_min_effective,
             std_workers=std_workers, std_p=std_p,
-            collect_stats=True
+            collect_stats=True, n_eff_mode = n_eff_mode,
         )
         sb_im, stats_im = bin_data(
             uu[i], vv[i], vis_imag[i], weight[i], invvar_group_im[i], (u_edges, v_edges),
@@ -385,7 +386,7 @@ def grid_cube_all_stats(
             statistics_fn="std", verbose=0,
             std_min_effective=std_min_effective,
             std_workers=std_workers, std_p=std_p,
-            collect_stats=True
+            collect_stats=True, n_eff_mode = n_eff_mode,
         )
 
         # Counts
@@ -500,6 +501,7 @@ def grid_cube_all_stats_wbinned(
     std_workers: int = 6,
     std_min_effective: int = 5,
     tqdm_ncols: int = 200,
+    n_eff_mode: str = "both"
 ) -> Tuple[
     np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray,
     np.ndarray, np.ndarray, np.ndarray
@@ -635,7 +637,7 @@ def grid_cube_all_stats_wbinned(
                 std_min_effective=std_min_effective,
                 std_workers=std_workers,
                 std_p=std_p,
-                collect_stats=True,
+                collect_stats=True, n_eff_mode = n_eff_mode,
             )
             sb_im, stats_im = bin_data(
                 u_b, v_b, im_b, wgt_b, invv_im_b, (u_edges, v_edges),
@@ -644,7 +646,7 @@ def grid_cube_all_stats_wbinned(
                 std_min_effective=std_min_effective,
                 std_workers=std_workers,
                 std_p=std_p,
-                collect_stats=True,
+                collect_stats=True, n_eff_mode = n_eff_mode,
             )
 
             # Store

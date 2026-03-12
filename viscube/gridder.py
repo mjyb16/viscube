@@ -26,25 +26,55 @@ def bin_data(
     std_min_effective: int = 5,
     std_expand_step: float = 0.1,
     collect_stats: bool = False,
+    n_eff_mode: str = "both",
 ):
     """
     Hybrid std behavior:
       - Normal pixels: empirical within-pixel scatter -> SE(mean)
-      - Low-info pixels: propagated SE(mean) using invvar_group (per-visibility inverse variance)
+      - Low-info pixels: propagated SE(mean) using invvar_group
+        (per-visibility inverse variance)
 
     Parameters
     ----------
     invvar_group : ndarray or None
-        Per-visibility inverse variance aligned with `values` (same length as u/v/values).
+        Per-visibility inverse variance aligned with `values`
+        (same length as u/v/values).
         Used ONLY in low-info std fallback.
+
+    n_eff_mode : {"geometric", "both"}
+        Choice of effective sample size definition used consistently
+        for both:
+          1) the fallback trigger
+          2) the normal-case SE(mean) correction
+
+        - "geometric":
+            n_eff = (sum imp)^2 / sum(imp^2)
+            Uses kernel-only support / geometric weighting.
+
+        - "both":
+            n_eff = (sum local_w)^2 / sum(local_w^2)
+            Uses full weights * kernel, i.e. incorporates both geometric
+            interpolation weighting and measurement weighting.
+
+    Returns
+    -------
+    grid : ndarray
+        Output gridded statistic.
+
+    If collect_stats is True:
+        returns (grid, n_fallback)
     """
+    allowed_modes = {"geometric", "both"}
+    if n_eff_mode not in allowed_modes:
+        raise ValueError(
+            f"n_eff_mode must be one of {allowed_modes}, got {n_eff_mode!r}"
+        )
+
     u_edges, v_edges = bins
     Nu = len(u_edges) - 1
     Nv = len(v_edges) - 1
 
-    # Keep your current shape convention (we can revisit later)
     grid = np.zeros((Nu, Nv), dtype=float)
-
     n_fallback = 0
 
     for k, data_indices in enumerate(pairs):
@@ -52,45 +82,41 @@ def bin_data(
             continue
 
         u_center, v_center = grid_tree.data[k]
+        i, j = divmod(k, Nv)
 
-        # kernel
+        # Kernel weights
         wu = window_fn(u[data_indices], u_center)
         wv = window_fn(v[data_indices], v_center)
         imp = wu * wv
 
-        # weighted mean/count weights use your original weights
-        w = weights[data_indices] * imp
-        if w.sum() <= 0:
+        # Combined measurement * interpolation weights
+        local_w = weights[data_indices] * imp
+        if np.sum(local_w) <= 0:
             continue
 
         val = values[data_indices]
-        i, j = divmod(k, Nv)
 
         if statistics_fn == "mean":
-            grid[i, j] = np.sum(val * w) / np.sum(w)
+            grid[i, j] = np.sum(val * local_w) / np.sum(local_w)
 
         elif statistics_fn == "std":
-            indices = data_indices
-
-            # Recompute kernel on `indices` (same as above, but explicit for clarity)
-            wu = window_fn(u[indices], u_center)
-            wv = window_fn(v[indices], v_center)
-            imp = wu * wv
-
-            # "Information" criterion (same spirit as your original)
-            effective = (imp > 0).sum()
+            # Unified N_eff: used for both fallback trigger and SE correction
+            if n_eff_mode == "geometric":
+                n_eff = (imp.sum() ** 2) / (np.sum(imp**2) + 1e-12)
+            else:  # n_eff_mode == "both"
+                n_eff = (local_w.sum() ** 2) / (np.sum(local_w**2) + 1e-12)
 
             # ---------------------------
-            # LOW-INFO FALLBACK: propagate SE(mean) from group invvar
+            # LOW-INFO FALLBACK
             # ---------------------------
-            if effective < std_min_effective:
+            if n_eff < std_min_effective:
                 n_fallback += 1
 
                 if invvar_group is None:
                     grid[i, j] = np.nan
                     continue
 
-                invv = np.asarray(invvar_group[indices], dtype=float)
+                invv = np.asarray(invvar_group[data_indices], dtype=float)
 
                 ok = np.isfinite(invv) & (invv > 0) & np.isfinite(imp) & (imp > 0)
                 if not np.any(ok):
@@ -108,30 +134,25 @@ def bin_data(
                 continue
 
             # ---------------------------
-            # NORMAL CASE: empirical within-pixel scatter -> SE(mean)
+            # NORMAL CASE
             # ---------------------------
-            local_w = weights[indices] * imp
-            if np.sum(local_w) <= 0:
-                grid[i, j] = np.nan
-                continue
-
-            val = values[indices]
             mean_val = np.sum(val * local_w) / np.sum(local_w)
             var = np.sum(local_w * (val - mean_val)**2) / np.sum(local_w)
-
-            # kernel-only effective sample size (your existing choice)
-            n_eff = (imp.sum() ** 2) / (np.sum(imp**2) + 1e-12)
 
             if n_eff <= 1:
                 grid[i, j] = np.nan
             else:
-                grid[i, j] = np.sqrt(var) * np.sqrt(n_eff / (n_eff - 1.0)) * (1.0 / np.sqrt(n_eff))
+                grid[i, j] = (
+                    np.sqrt(var)
+                    * np.sqrt(n_eff / (n_eff - 1.0))
+                    / np.sqrt(n_eff)
+                )
 
         elif statistics_fn == "count":
-            grid[i, j] = (w > 0).sum()
+            grid[i, j] = (local_w > 0).sum()
 
         elif callable(statistics_fn):
-            grid[i, j] = statistics_fn(val, w)
+            grid[i, j] = statistics_fn(val, local_w)
 
     if collect_stats:
         return grid, n_fallback
