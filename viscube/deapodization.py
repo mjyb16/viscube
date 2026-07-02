@@ -165,6 +165,129 @@ def make_apodization_map(
     return apo_2d
 
 
+def _kb_sinhc(z2: np.ndarray) -> np.ndarray:
+    """
+    Branch-safe evaluation of sinh(sqrt(z2))/sqrt(z2), analytically continued
+    to sin(sqrt(-z2))/sqrt(-z2) for z2 < 0, with the z2 -> 0 limit = 1.
+    Branches are evaluated under masks (a naive np.where would evaluate sinh
+    on the sin-branch arguments and overflow).
+    """
+    z2 = np.asarray(z2, dtype=float)
+    out = np.ones_like(z2)
+    pos = z2 > 1e-24
+    neg = z2 < -1e-24
+    sp = np.sqrt(z2[pos])
+    out[pos] = np.sinh(sp) / sp
+    sn = np.sqrt(-z2[neg])
+    out[neg] = np.sin(sn) / sn
+    return out
+
+
+def make_kb_taper_1d(
+    *,
+    npix: int,
+    delta_u: float,
+    m: int = 1,
+    beta: float = 2.0,
+    normalize: Optional[str] = "peak",
+) -> np.ndarray:
+    """
+    ANALYTIC image-plane taper of the Kaiser–Bessel gridding kernel
+    (`viscube.windows.kb_kernel_1d` with the same m, beta), i.e. the exact
+    Fourier transform of
+
+        k(u) = I0(beta * sqrt(1 - (2u/W)^2)) / I0(beta),  |u| <= W/2,
+        W = m * delta_u:
+
+        c(x) ∝ sinh(sqrt(beta^2 - (pi W x)^2)) / sqrt(beta^2 - (pi W x)^2),
+
+    continued to the sin branch when |pi W x| > beta; beta = 0 gives exactly
+    sinc(W x) (pillbox taper). Evaluated on the fftshifted image grid
+    x_i = (i - npix//2) / (npix * delta_u) [rad].
+
+    This is the map a forward model must MULTIPLY its image by (before the
+    FFT) so that reading the FFT at cell centers matches data gridded as
+    per-cell kernel-weighted means. It replaces `make_apodization_1d` for
+    small kernels: that function samples the kernel at INTEGER delta_u
+    offsets, which for m=1 hits only offset 0 and returns a constant map.
+    """
+    if npix <= 0:
+        raise ValueError(f"npix must be positive, got {npix}.")
+    if delta_u <= 0:
+        raise ValueError(f"delta_u must be positive, got {delta_u}.")
+    if beta < 0:
+        raise ValueError(f"beta must be >= 0, got {beta}.")
+
+    W = m * float(delta_u)
+    x = (np.arange(npix, dtype=float) - (npix // 2)) / (npix * float(delta_u))
+    z2 = beta ** 2 - (np.pi * W * x) ** 2
+    taper = _kb_sinhc(z2)
+
+    if normalize == "peak":
+        s = np.max(np.abs(taper))
+        if s > 0:
+            taper = taper / s
+    elif normalize == "center":
+        s = taper[npix // 2]
+        if s != 0:
+            taper = taper / s
+    elif normalize is None:
+        pass
+    else:
+        raise ValueError("normalize must be 'peak', 'center', or None.")
+    return taper
+
+
+def make_kb_taper_map(
+    *,
+    npix: int,
+    delta_u: float,
+    m: int = 1,
+    beta: float = 2.0,
+    normalize: Optional[str] = "peak",
+) -> np.ndarray:
+    """
+    2D separable analytic Kaiser–Bessel taper map (outer product of
+    `make_kb_taper_1d`), shape (npix, npix).
+    """
+    t1 = make_kb_taper_1d(npix=npix, delta_u=delta_u, m=m, beta=beta,
+                          normalize=normalize)
+    t2 = np.outer(t1, t1)
+    if normalize == "peak":
+        s = np.max(np.abs(t2))
+        if s > 0:
+            t2 = t2 / s
+    elif normalize == "center":
+        s = t2[npix // 2, npix // 2]
+        if s != 0:
+            t2 = t2 / s
+    return t2
+
+
+def stabilized_inverse_map(
+    apo: np.ndarray,
+    *,
+    eps_fraction: float = 1e-3,
+    clamp_max: Optional[float] = 1e3,
+) -> np.ndarray:
+    """
+    Stabilized elementwise inverse of an apodization/taper map — verbatim
+    numpy port of the legacy logic that used to live inside
+    ``VisibilityCubePadded.__init__`` (threshold at eps_fraction * max|apo|,
+    zero below threshold, clamp to ±clamp_max). Kept ONLY so the legacy
+    divide-by-apodization behavior remains reproducible (pass the result as
+    ``image_taper_map``); the corrected convention is to MULTIPLY by the
+    taper, not divide.
+    """
+    apo = np.asarray(apo, dtype=float)
+    thresh = float(eps_fraction) * np.max(np.abs(apo))
+    safe = np.abs(apo) >= thresh
+    inv = np.where(safe, 1.0 / np.where(safe, apo, 1.0), 0.0)
+    if clamp_max is not None:
+        inv = np.clip(inv, -float(clamp_max), float(clamp_max))
+    return inv
+
+
 def save_apodization_map(
     path: str,
     apodization_map: np.ndarray,

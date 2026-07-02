@@ -1,7 +1,6 @@
 import numpy as np
 from typing import Optional
 from scipy.special import i0  # Modified Bessel I0
-import sys
 
 # ---- CASA/Schwab 1984 spheroidal rational approximation coefficients ----
 _SPH_A = np.array([0.01624782, -0.05350728, 0.1464354, -0.2347118,
@@ -63,6 +62,12 @@ def kaiser_bessel_window(u,
         return w
 
     if beta is None:
+        if (m / 2.0) ** 2 <= 0.8:
+            raise ValueError(
+                f"kaiser_bessel_window: the default beta formula "
+                f"pi*sqrt((m/2)^2 - 0.8) is invalid for m={m} (m < ~1.8). "
+                "Pass beta explicitly (beta=0 is a pillbox)."
+            )
         beta = np.pi * np.sqrt((m / 2.0)**2 - 0.8)
 
     t = dist[mask] / half_width  # in [0,1]
@@ -75,13 +80,46 @@ def kaiser_bessel_window(u,
             w_vals = w_vals / w0
     w[mask] = w_vals
     if np.any(w < 0):
-        print("Error: negative weights")
-        print(f"U values: {u}")
-        print(f"Center values: {center}")
-        print(f"Beta values: {beta}")
-        print(f"W values: {w}")
-        print(f"Denom values: {denom}")
-        sys.exit()
+        raise ValueError(
+            "kaiser_bessel_window produced negative weights "
+            f"(beta={beta}, center={center}, denom={denom})."
+        )
+    return w
+
+
+def kb_kernel_1d(du,
+                 *,
+                 delta_u: float,
+                 m: int = 1,
+                 beta: float = 2.0) -> np.ndarray:
+    """
+    Analytic 1D Kaiser–Bessel gridding kernel evaluated at uv offsets ``du``
+    from a cell center:
+
+        k(du) = I0(beta * sqrt(1 - (du/half_width)^2)) / I0(beta),
+        half_width = 0.5 * m * delta_u,  k = 0 outside |du| <= half_width.
+
+    Peak value is exactly 1 at du = 0; ``beta = 0`` reduces exactly to a
+    pillbox (boxcar) of total width ``m * delta_u``.
+
+    Unlike ``kaiser_bessel_window(normalize=True)``, this applies NO
+    batch normalization (that normalization divides by the max of the
+    evaluated batch, which is wrong when accumulating many cells at once),
+    so it is safe for vectorized binning.
+    """
+    if delta_u <= 0:
+        raise ValueError(f"delta_u must be positive, got {delta_u}.")
+    if beta < 0:
+        raise ValueError(f"beta must be >= 0, got {beta}.")
+    du = np.asarray(du, dtype=float)
+    half_width = 0.5 * m * float(delta_u)
+    t2 = (du / half_width) ** 2
+    w = np.zeros_like(du, dtype=float)
+    inside = t2 <= 1.0
+    if beta == 0.0:
+        w[inside] = 1.0
+    else:
+        w[inside] = i0(beta * np.sqrt(1.0 - t2[inside])) / i0(beta)
     return w
 
 

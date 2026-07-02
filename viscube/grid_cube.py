@@ -7,7 +7,7 @@ from tqdm import tqdm
 from functools import wraps
 
 # Use your existing implementations
-from .gridder import bin_data
+from .gridder import bin_data, bin_channel_nonoverlap
 from .windows import (
     kaiser_bessel_window,
     casa_pswf_window,
@@ -415,6 +415,172 @@ def grid_cube_all_stats(
         uv_grid_to_fft_image_convention(np.asarray(counts)),
         u_edges, v_edges
     )
+
+
+def grid_cube_all_stats_nonoverlap(
+    *,
+    frequencies: np.ndarray,
+    uu: np.ndarray,
+    vv: np.ndarray,
+    vis_re: np.ndarray,
+    vis_imag: np.ndarray,
+    weight: np.ndarray,
+    invvar_group_re: np.ndarray,
+    invvar_group_im: np.ndarray,
+    npix: int = 501,
+    fov_arcsec: Optional[float] = None,
+    pad_uv: float = 0.0,
+    m: int = 1,
+    beta: float = 2.0,
+    std_min_effective: int = 5,
+    n_eff_mode: str = "both",
+    drop_dc_duplicates: bool = True,
+    n_aug: Optional[int] = None,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Non-overlapping drop-in alternative to `grid_cube_all_stats`: each
+    visibility lands in exactly ONE uv cell (searchsorted binning) with
+    within-bin weighting ``weight * KB(du)*KB(dv)`` (``m=1`` makes the KB
+    support coincide exactly with the bin; ``beta=0`` is a pillbox).
+    Output tuple and per-cell statistics are schema-identical to
+    `grid_cube_all_stats`.
+
+    drop_dc_duplicates / n_aug
+        When the inputs are hermitian-augmented (originals first, conjugate
+        copies appended), pass ``n_aug`` = number of ORIGINAL visibilities
+        per channel so that augmented copies landing in the DC cell are
+        dropped (otherwise a short-baseline visibility and its conjugate
+        both land there: imag forced to ~0, SE understated by sqrt(2)).
+
+    Loudly warns (RuntimeWarning) if ANY visibility falls outside the grid
+    (silently dropped baselines were a long-standing silent failure mode).
+    """
+    if drop_dc_duplicates and n_aug is None:
+        raise ValueError(
+            "drop_dc_duplicates=True requires n_aug (number of pre-augmentation "
+            "visibilities per channel). Pass n_aug, or drop_dc_duplicates=False "
+            "if the input is NOT hermitian-augmented."
+        )
+
+    u_edges, v_edges, delta_u, _ = make_uv_grid(
+        uu, vv, npix=npix, pad_uv=pad_uv, fov_arcsec=fov_arcsec, warn_crop=True
+    )
+
+    F = uu.shape[0]
+    Nu = len(u_edges) - 1
+    Nv = len(v_edges) - 1
+
+    mean_re = np.zeros((F, Nu, Nv), dtype=np.float64)
+    std_re  = np.zeros((F, Nu, Nv), dtype=np.float64)
+    mean_im = np.zeros((F, Nu, Nv), dtype=np.float64)
+    std_im  = np.zeros((F, Nu, Nv), dtype=np.float64)
+    counts  = np.zeros((F, Nu, Nv), dtype=np.float64)
+
+    dc_from = int(n_aug) if drop_dc_duplicates else None
+    tot_dropped = 0
+    tot_dc_dropped = 0
+    tot_fallback = 0
+    n_vis_total = 0
+    per_channel_dropped = []
+
+    pbar = tqdm(range(F), unit="channel")
+    for i in pbar:
+        kw = dict(m=m, beta=beta, std_min_effective=std_min_effective,
+                  n_eff_mode=n_eff_mode, dc_dedup_from=dc_from)
+        mr, sr, cnt, st_re = bin_channel_nonoverlap(
+            uu[i], vv[i], vis_re[i], weight[i], invvar_group_re[i],
+            u_edges, v_edges, **kw)
+        mi, si, _, st_im = bin_channel_nonoverlap(
+            uu[i], vv[i], vis_imag[i], weight[i], invvar_group_im[i],
+            u_edges, v_edges, **kw)
+
+        mean_re[i], std_re[i], counts[i] = mr, sr, cnt
+        mean_im[i], std_im[i] = mi, si
+
+        n_vis_total += uu[i].size
+        tot_dropped += st_re["n_dropped"]
+        tot_dc_dropped += st_re["n_dc_dropped"]
+        tot_fallback += st_re["n_fallback"] + st_im["n_fallback"]
+        per_channel_dropped.append(st_re["n_dropped"])
+        pbar.set_postfix(dropped=st_re["n_dropped"],
+                         dc_dedup=st_re["n_dc_dropped"],
+                         fallback_re=st_re["n_fallback"],
+                         fallback_im=st_im["n_fallback"])
+
+    if tot_dropped > 0:
+        worst = int(np.argmax(per_channel_dropped))
+        warnings.warn(
+            f"grid_cube_all_stats_nonoverlap: {tot_dropped} of {n_vis_total} "
+            f"visibilities ({tot_dropped / n_vis_total:.2%}) fall OUTSIDE the uv grid "
+            f"and were DROPPED (worst channel {worst}: {per_channel_dropped[worst]}). "
+            "The grid half-range is smaller than the longest baseline — increase npix "
+            "and/or decrease fov_arcsec.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+    print(f"[grid_nonoverlap] dropped outside grid: {tot_dropped}/{n_vis_total} "
+          f"({(tot_dropped / n_vis_total if n_vis_total else 0):.2%}); "
+          f"DC-duplicate copies removed: {tot_dc_dropped}; "
+          f"low-info std fallbacks (re+im): {tot_fallback}")
+
+    return (
+        uv_grid_to_fft_image_convention(mean_re),
+        uv_grid_to_fft_image_convention(mean_im),
+        uv_grid_to_fft_image_convention(std_re),
+        uv_grid_to_fft_image_convention(std_im),
+        uv_grid_to_fft_image_convention(counts),
+        u_edges, v_edges
+    )
+
+
+# -----------------------
+# Hermitian half-plane utilities
+# -----------------------
+#
+# For a REAL image, the fftshifted uv plane of odd side npix (center
+# c = npix//2) is Hermitian-symmetric under (row, col) -> (2c-row, 2c-col):
+# every cell with row > c has its conjugate duplicate at row < c, and the
+# DC row (row == c) maps onto itself with columns mirrored about col == c.
+# The arrays returned by grid_cube_all_stats* (after
+# uv_grid_to_fft_image_convention) are elementwise aligned with the model's
+# fftshift(fft2(ifftshift(image))) plane, so the non-redundant half is the
+# slab rows [c:], with the left half of its first row (the DC row) masked.
+
+
+def half_plane_slab(arr_conv: np.ndarray, npix: int) -> np.ndarray:
+    """
+    Slice the non-redundant Hermitian half-plane slab (rows [npix//2:]) out
+    of a full-plane array in FFT/image convention (last two axes (npix, npix)).
+    Result shape (..., (npix+1)//2, npix). Requires ODD npix (even npix has a
+    Nyquist row that breaks the slab symmetry).
+    """
+    npix = int(npix)
+    if npix % 2 != 1:
+        raise ValueError(f"half_plane_slab requires odd npix, got {npix}.")
+    if arr_conv.shape[-2:] != (npix, npix):
+        raise ValueError(
+            f"expected last two axes ({npix}, {npix}), got {arr_conv.shape[-2:]}."
+        )
+    return arr_conv[..., npix // 2:, :]
+
+
+def half_plane_mask_fix(mask_slab: np.ndarray, npix: int) -> np.ndarray:
+    """
+    Zero the conjugate-duplicate columns of the DC row in a half-plane mask
+    slab: slab row 0 is the self-mirroring DC row, whose columns [0:npix//2]
+    duplicate columns [npix//2+1:]. Returns a copy; the DC cell itself
+    (slab[..., 0, npix//2]) is KEPT.
+    """
+    npix = int(npix)
+    c = npix // 2
+    if mask_slab.shape[-2:] != ((npix + 1) // 2, npix):
+        raise ValueError(
+            f"expected half-plane slab last axes ({(npix + 1) // 2}, {npix}), "
+            f"got {mask_slab.shape[-2:]}."
+        )
+    out = mask_slab.copy()
+    out[..., 0, :c] = False if out.dtype == bool else 0
+    return out
 
 
 def _make_w_edges(
