@@ -20,7 +20,7 @@ sphinx:
 # Specify dependencies to be installed
 # Define the system dependencies
 build:
-  os: "ubuntu-20.04"
+  os: "ubuntu-22.04"
   tools:
     python: "3.10"
   apt_packages:
