@@ -32,8 +32,6 @@ build:
       - "jupyter-book config sphinx docs/source/"
       # Create font cache ahead of jupyter book
       - 'python -c "import matplotlib.pyplot as plt"'
-      # Get the API documentation dynamically
-      - "sphinx-apidoc -f -o docs/source/ viscube/"
 
 python:
   install:

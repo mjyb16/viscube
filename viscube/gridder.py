@@ -1,3 +1,21 @@
+"""
+Low-level per-channel gridding engines.
+
+Two engines are provided:
+
+- :func:`bin_data` — the original kernel-overlap gridder. Every uv cell
+  gathers all visibilities within ``truncation_radius`` of its center
+  (KDTree neighbor lookup), so one visibility can contribute to several
+  cells when the kernel support exceeds one cell.
+- :func:`bin_channel_nonoverlap` — a vectorized non-overlapping binner in
+  which each visibility contributes to exactly one uv cell (its containing
+  bin), with within-bin Kaiser–Bessel weighting.
+
+Both produce per-cell weighted means, hybrid standard errors (empirical
+scatter with a propagated-variance fallback for low-information cells),
+and sample counts. Most users should call the channel-loop wrappers in
+:mod:`viscube.grid_cube` rather than these functions directly.
+"""
 import numpy as np
 from scipy.spatial import cKDTree
 from tqdm import tqdm
@@ -37,20 +55,58 @@ def bin_channel_nonoverlap(
                fall back to the propagated invvar SE; n_eff <= 1 -> NaN
       - counts : number of contributing samples per cell
 
-    Parameters mirror `bin_data`; additionally
-
+    Parameters
+    ----------
+    u, v : array-like
+        uv coordinates of the visibilities for this channel, in
+        wavelengths. Flattened to 1D.
+    values : array-like
+        Real-valued quantity to grid (e.g. the real or imaginary part of
+        the visibilities), aligned with ``u``/``v``.
+    weights : array-like
+        Per-visibility measurement weights (e.g. from the measurement
+        set's WEIGHT column). Non-finite or non-positive weights are
+        excluded.
+    invvar_group : array-like or None
+        Per-visibility inverse variance aligned with ``values``, used ONLY
+        for the low-info std fallback (see
+        :func:`viscube.sigma_per_baseline.sigma_by_baseline_scan_time_diff`).
+        If None, low-info cells get ``std = NaN``.
+    u_edges, v_edges : ndarray
+        Bin edges of the uv grid, shapes ``(Nu+1,)`` and ``(Nv+1,)``
+        (as returned by :func:`viscube.grid_cube.make_uv_grid`).
+    m : int
+        Kaiser–Bessel kernel support in cells (see
+        :func:`viscube.windows.kb_kernel_1d`). ``m = 1`` makes the kernel
+        support coincide exactly with the bin.
+    beta : float
+        Kaiser–Bessel shape parameter; ``beta = 0`` gives a pillbox.
+    std_min_effective : int
+        Cells with effective sample size ``n_eff`` below this threshold use
+        the propagated-variance fallback instead of the empirical scatter.
+    n_eff_mode : {"geometric", "both"}
+        Effective-sample-size definition; see :func:`bin_data`.
     dc_dedup_from : int, optional
         If given, samples with index >= dc_dedup_from (i.e. the
         hermitian-augmented copies, when the first ``dc_dedup_from``
         entries are the originals) whose target cell is the DC cell are
-        DROPPED. Without this, a visibility with |u|,|v| < delta_u/2 and
-        its augmented conjugate both land in the DC cell (imag forced to
-        ~0, weight doubled, SE understated by sqrt(2)).
+        DROPPED. Without this, a visibility with ``|u|, |v| < delta_u/2``
+        and its augmented conjugate both land in the DC cell (imag forced
+        to ~0, weight doubled, SE understated by sqrt(2)).
 
     Returns
     -------
-    mean, std, counts : ndarray (Nu, Nv)
-    stats : dict with n_fallback, n_dropped (outside grid), n_dc_dropped
+    mean : ndarray, shape (Nu, Nv)
+        Weighted mean per cell (0 where empty).
+    std : ndarray, shape (Nu, Nv)
+        Standard error of the weighted mean per cell (NaN where it cannot
+        be estimated).
+    counts : ndarray, shape (Nu, Nv)
+        Number of contributing samples per cell.
+    stats : dict
+        Diagnostics: ``n_fallback`` (cells that used the propagated
+        fallback), ``n_dropped`` (visibilities outside the grid),
+        ``n_dc_dropped`` (augmented copies removed from the DC cell).
     """
     if n_eff_mode not in {"geometric", "both"}:
         raise ValueError(f"n_eff_mode must be 'geometric' or 'both', got {n_eff_mode!r}")
@@ -174,6 +230,13 @@ def bin_data(
     n_eff_mode: str = "both",
 ):
     """
+    Kernel-overlap gridder for one channel and one statistic.
+
+    Each uv cell gathers all visibilities within ``truncation_radius`` of
+    its center (precomputed KDTree ``pairs``), weights them by
+    ``weights * window_fn(u) * window_fn(v)``, and reduces them to the
+    requested per-cell statistic.
+
     Hybrid std behavior:
       - Normal pixels: empirical within-pixel scatter -> SE(mean)
       - Low-info pixels: propagated SE(mean) using invvar_group
@@ -181,33 +244,69 @@ def bin_data(
 
     Parameters
     ----------
+    u, v : ndarray
+        uv coordinates of the visibilities for this channel, in
+        wavelengths.
+    values : ndarray
+        Real-valued quantity to grid (e.g. the real or imaginary part of
+        the visibilities), aligned with ``u``/``v``.
+    weights : ndarray
+        Per-visibility measurement weights, aligned with ``values``.
     invvar_group : ndarray or None
         Per-visibility inverse variance aligned with `values`
         (same length as u/v/values).
         Used ONLY in low-info std fallback.
-
+    bins : tuple of ndarray
+        ``(u_edges, v_edges)`` bin edges of the uv grid, shapes
+        ``(Nu+1,)`` and ``(Nv+1,)``.
+    window_fn : callable
+        Bound window ``window(u, center)`` (see
+        :mod:`viscube.windows`); applied separably in u and v.
+    truncation_radius : float
+        Neighbor-search radius used to build ``pairs``; typically
+        ``delta_u`` from :func:`viscube.grid_cube.make_uv_grid`.
+    uv_tree, grid_tree : scipy.spatial.cKDTree
+        KD-trees over the visibility uv points and the cell centers, as
+        returned by ``precompute_pairs``.
+    pairs : sequence of sequence of int
+        For each flattened grid cell, the indices of the visibilities
+        within ``truncation_radius`` of its center
+        (``grid_tree.query_ball_tree(uv_tree, truncation_radius)``).
+    statistics_fn : {"mean", "std", "count"} or callable
+        Statistic to compute per cell. A callable receives
+        ``(values, local_weights)`` for one cell and must return a scalar.
+    verbose : int
+        Unused; retained for backward compatibility.
+    window_kwargs : dict, optional
+        Unused; retained for backward compatibility (bind kwargs into
+        ``window_fn`` instead).
+    std_p, std_workers, std_expand_step : int, int, float
+        Unused; retained for backward compatibility with older
+        neighbor-expansion std estimators.
+    std_min_effective : int
+        Cells with effective sample size ``n_eff`` below this threshold use
+        the propagated-variance fallback instead of the empirical scatter.
+    collect_stats : bool
+        If True, also return the number of cells that triggered the
+        low-info fallback.
     n_eff_mode : {"geometric", "both"}
-        Choice of effective sample size definition used consistently
-        for both:
-          1) the fallback trigger
-          2) the normal-case SE(mean) correction
+        Choice of effective sample size definition, used consistently for
+        both the fallback trigger and the normal-case SE(mean) correction:
 
-        - "geometric":
-            n_eff = (sum imp)^2 / sum(imp^2)
-            Uses kernel-only support / geometric weighting.
-
-        - "both":
-            n_eff = (sum local_w)^2 / sum(local_w^2)
-            Uses full weights * kernel, i.e. incorporates both geometric
-            interpolation weighting and measurement weighting.
+        - "geometric": ``n_eff = (sum imp)^2 / sum(imp^2)`` — kernel-only
+          support / geometric weighting.
+        - "both": ``n_eff = (sum local_w)^2 / sum(local_w^2)`` — full
+          weights * kernel, i.e. incorporates both geometric interpolation
+          weighting and measurement weighting.
 
     Returns
     -------
-    grid : ndarray
-        Output gridded statistic.
-
-    If collect_stats is True:
-        returns (grid, n_fallback)
+    grid : ndarray, shape (Nu, Nv)
+        Output gridded statistic. For ``statistics_fn="std"``, cells whose
+        SE cannot be estimated are NaN.
+    n_fallback : int
+        Number of low-info fallback cells. Only returned when
+        ``collect_stats`` is True.
     """
     allowed_modes = {"geometric", "both"}
     if n_eff_mode not in allowed_modes:

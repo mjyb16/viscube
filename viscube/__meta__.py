@@ -1,3 +1,4 @@
+"""Package metadata (name, version, author) used by setup.py and __init__."""
 # `name` is the name of the package as used for `pip install package`
 name = "viscube"
 # `path` is the name of the package for `import package`

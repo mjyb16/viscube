@@ -1,3 +1,14 @@
+"""
+Per-visibility noise estimation from time-differenced visibilities.
+
+Provides :func:`sigma_by_baseline_scan_time_diff`, which estimates the
+noise sigma of each visibility's real and imaginary parts by differencing
+consecutive time samples within (scan, baseline) groups — the sky signal
+cancels in the difference, leaving (twice) the thermal noise. The
+resulting sigmas feed the ``invvar_group_re`` / ``invvar_group_im``
+arguments of the gridding functions (as ``1 / sigma**2``), which use them
+in the low-information standard-error fallback.
+"""
 import numpy as np
 from typing import Tuple
 
@@ -68,6 +79,14 @@ def sigma_by_baseline_scan_time_diff(
         Estimated per-visibility sigma for real part.
     sigma_im : ndarray, shape (nchan, nvis)
         Estimated per-visibility sigma for imaginary part.
+
+    Notes
+    -----
+    The diff-std is estimated robustly (MAD; see :func:`mad_std`), so
+    occasional outliers do not inflate the sigmas. Channels/groups with
+    too few valid pairs are filled with the per-channel median sigma, or
+    ``sigma_floor`` if no finite median exists, so the outputs never
+    contain NaNs.
     """
     nchan, nvis = data.shape
     sigma_re = np.full((nchan, nvis), np.nan, dtype=np.float64)

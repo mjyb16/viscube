@@ -1,3 +1,21 @@
+"""
+High-level spectral-cube gridding API and uv-grid utilities.
+
+This is VisCube's main user-facing module. A typical pipeline is:
+
+1. :func:`load_and_mask` — apply the per-channel validity mask and compact
+   the visibility arrays.
+2. :func:`hermitian_augment` — append the conjugate copies
+   ``V(-u, -v) = conj(V(u, v))`` so the gridded plane is Hermitian.
+3. :func:`grid_cube_all_stats` (kernel-overlap) or
+   :func:`grid_cube_all_stats_nonoverlap` (one-cell-per-visibility) — grid
+   every channel and estimate per-cell means, standard errors, and counts.
+   :func:`grid_cube_all_stats_wbinned` additionally bins in w.
+
+The remaining functions are building blocks (uv-grid construction, window
+binding, axis-convention conversion) and Hermitian half-plane utilities
+for likelihoods that keep only the non-redundant half of the uv plane.
+"""
 import warnings
 from typing import Callable, Tuple, Sequence, Optional, Union
 import numpy as np
@@ -6,7 +24,6 @@ import inspect
 from tqdm import tqdm
 from functools import wraps
 
-# Use your existing implementations
 from .gridder import bin_data, bin_channel_nonoverlap
 from .windows import (
     kaiser_bessel_window,
@@ -31,11 +48,46 @@ def load_and_mask(
     mask: np.ndarray,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
-    Apply per-channel mask and compact arrays.
-    Returns frequencies, u0, v0, vis0, w0, sigma_re0, sigma_im0.
+    Apply the per-channel validity mask and compact the visibility arrays.
 
-    Assumes the number of valid visibilities is the same for every channel
-    (as in your current implementation). If not, this should be changed to ragged lists.
+    Keeps only the visibilities where ``mask`` is True in each channel and
+    packs them into dense ``(F, Nmasked)`` arrays.
+
+    Parameters
+    ----------
+    frequencies : ndarray, shape (F,)
+        Channel frequencies in Hz. Passed through unchanged.
+    uu, vv : ndarray, shape (F, Nvis)
+        uv coordinates per channel, in wavelengths.
+    vis : ndarray, shape (F, Nvis), complex
+        Complex visibilities.
+    weight : ndarray, shape (F, Nvis)
+        Per-visibility measurement weights.
+    sigma_re, sigma_im : ndarray, shape (F, Nvis)
+        Per-visibility noise sigma of the real and imaginary parts (e.g.
+        from :func:`viscube.sigma_per_baseline.sigma_by_baseline_scan_time_diff`).
+    mask : ndarray, shape (F, Nvis), bool
+        Validity mask; True marks visibilities to keep.
+
+    Returns
+    -------
+    frequencies : ndarray, shape (F,)
+        Unchanged channel frequencies.
+    u0, v0 : ndarray, shape (F, Nmasked)
+        Masked, compacted uv coordinates.
+    vis0 : ndarray, shape (F, Nmasked), complex
+        Masked, compacted visibilities.
+    w0 : ndarray, shape (F, Nmasked)
+        Masked, compacted weights.
+    sigma_re0, sigma_im0 : ndarray, shape (F, Nmasked)
+        Masked, compacted noise sigmas.
+
+    Raises
+    ------
+    ValueError
+        If the number of valid visibilities differs between channels
+        (the compacted representation requires a constant count; use a
+        ragged representation otherwise).
     """
     F = len(frequencies)
     Nmasked = int(mask[0].sum())
@@ -74,14 +126,45 @@ def hermitian_augment(
     sigma_im0: np.ndarray,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
-    Hermitian augment:
-      (u, v, Re, Im, w, sigma_re, sigma_im)
-      -> concat with
-      (-u, -v, +Re, -Im, w, sigma_re, sigma_im)
+    Hermitian-augment the visibilities.
+
+    For a real sky image the visibility function obeys
+    ``V(-u, -v) = conj(V(u, v))``, so each measurement can be mirrored to
+    the opposite uv point. This function concatenates, along the
+    visibility axis::
+
+        (u, v, Re, Im, w, sigma_re, sigma_im)
+        -> concat with
+        (-u, -v, +Re, -Im, w, sigma_re, sigma_im)
+
+    doubling the number of samples per channel. Note the augmented copies
+    are appended AFTER the originals; when gridding with
+    :func:`grid_cube_all_stats_nonoverlap`, pass the pre-augmentation
+    count as ``n_aug`` so DC-cell duplicates can be dropped.
+
+    Parameters
+    ----------
+    u0, v0 : ndarray, shape (F, N)
+        uv coordinates per channel, in wavelengths.
+    vis0 : ndarray, shape (F, N), complex
+        Complex visibilities.
+    w0 : ndarray, shape (F, N)
+        Per-visibility measurement weights.
+    sigma_re0, sigma_im0 : ndarray, shape (F, N)
+        Per-visibility noise sigma of the real and imaginary parts
+        (unchanged under conjugation).
 
     Returns
     -------
-    uu, vv, vis_re, vis_imag, w, sigma_re_aug, sigma_im_aug
+    uu, vv : ndarray, shape (F, 2N)
+        Augmented uv coordinates.
+    vis_re, vis_imag : ndarray, shape (F, 2N)
+        Augmented real and imaginary parts (imaginary part sign-flipped in
+        the copies).
+    w : ndarray, shape (F, 2N)
+        Augmented weights.
+    sigma_re_aug, sigma_im_aug : ndarray, shape (F, 2N)
+        Augmented noise sigmas.
     """
     uu = np.concatenate([u0, -u0], axis=1)
     vv = np.concatenate([v0, -v0], axis=1)
@@ -110,14 +193,50 @@ def make_uv_grid(
     warn_crop: bool = True,
 ) -> Tuple[np.ndarray, np.ndarray, float, float]:
     """
-    Build symmetric square uv grid; truncation_radius == delta_u.
+    Build a symmetric square uv grid; ``truncation_radius == delta_u``.
+
+    Two modes:
+
+    - **Legacy (``fov_arcsec=None``)**: the grid extent is inferred from
+      the data, ``u_max = max(|u|, |v|) * (1 + pad_uv)``, and split into
+      ``npix`` cells.
+    - **Explicit FOV**: the uv cell size is fixed by the requested
+      image-plane field of view, ``delta_u = 1 / fov_rad``, and the grid
+      spans ``npix * delta_u``. ``pad_uv`` is ignored (with a warning),
+      and a RuntimeWarning is raised if data fall outside the grid.
 
     Parameters
     ----------
+    uu, vv : ndarray
+        uv coordinates in wavelengths (any shape); used to infer the grid
+        extent (legacy mode) or to check for cropping (explicit-FOV mode).
+    npix : int
+        Number of uv cells per axis.
+    pad_uv : float
+        Fractional padding of the data extent in legacy mode. Ignored when
+        ``fov_arcsec`` is given.
     fov_arcsec : float, optional
         Image-plane field of view in arcseconds.
         If provided, uv cell size is set by delta_u = 1 / fov_rad, where
         fov_rad = fov_arcsec / 206265.
+    warn_crop : bool
+        In explicit-FOV mode, warn (RuntimeWarning) if any ``|u|`` or
+        ``|v|`` exceeds the grid half-range, reporting the affected
+        fraction.
+
+    Returns
+    -------
+    u_edges, v_edges : ndarray, shape (npix+1,)
+        Bin edges of the grid (identical for u and v).
+    delta_u : float
+        uv cell size in wavelengths.
+    truncation_radius : float
+        Kernel truncation radius for the overlap gridder (== ``delta_u``).
+
+    Raises
+    ------
+    ValueError
+        If ``npix <= 0`` or ``fov_arcsec`` is not a positive finite float.
 
     Notes
     -----
@@ -184,7 +303,21 @@ def make_uv_grid(
 
 def build_grid_centers(u_edges: np.ndarray, v_edges: np.ndarray) -> np.ndarray:
     """
-    Measurement Set conventions for grid centers.
+    Compute the (u, v) center coordinates of every grid cell.
+
+    Cells are enumerated with u as the outer (slowest) index and v as the
+    inner index, matching the flattened cell order used by the gridding
+    engines (``cell = iu * Nv + jv``).
+
+    Parameters
+    ----------
+    u_edges, v_edges : ndarray, shapes (Nu+1,), (Nv+1,)
+        Bin edges of the uv grid.
+
+    Returns
+    -------
+    centers : ndarray, shape (Nu * Nv, 2)
+        Cell-center coordinates ``(u, v)``, one row per cell.
     """
     Nu = len(u_edges) - 1
     Nv = len(v_edges) - 1
@@ -208,7 +341,29 @@ def precompute_pairs(
     p_metric: int = 1
 ) -> Tuple[cKDTree, cKDTree, Sequence[Sequence[int]]]:
     """
-    Build KD-trees and query neighbor pairs for a single channel.
+    Build KD-trees and query kernel-support neighbor pairs for one channel.
+
+    Parameters
+    ----------
+    uu_i, vv_i : ndarray
+        uv coordinates of this channel's visibilities, in wavelengths.
+    centers : ndarray, shape (Nu * Nv, 2)
+        Grid-cell centers from :func:`build_grid_centers`.
+    truncation_radius : float
+        Neighbor-search radius (typically ``delta_u``).
+    p_metric : int
+        Minkowski p-norm for the ball query (1 = Manhattan, giving a
+        square/diamond support; 2 = Euclidean, giving a circular support).
+
+    Returns
+    -------
+    uv_tree : scipy.spatial.cKDTree
+        Tree over the visibility uv points.
+    grid_tree : scipy.spatial.cKDTree
+        Tree over the grid-cell centers.
+    pairs : list of list of int
+        For each flattened grid cell, the indices of the visibilities
+        within ``truncation_radius`` of its center.
     """
     uv_points = np.vstack((uu_i.ravel(), vv_i.ravel())).T
     uv_tree = cKDTree(uv_points)
@@ -235,26 +390,77 @@ def grid_channel(
     verbose_std: int = 2,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
-    Grid one frequency channel using your existing bin_data.
+    Convenience wrapper: grid one frequency channel with :func:`bin_data`.
+
+    Computes the five standard per-cell statistics (mean/std of the real
+    and imaginary parts, plus counts) for a single channel. No propagated
+    low-info std fallback is available here (``invvar_group=None``), so
+    low-info cells get ``std = NaN``; the full-cube drivers
+    (:func:`grid_cube_all_stats` and friends) pass per-visibility inverse
+    variances instead and should be preferred.
+
+    Parameters
+    ----------
+    uu_i, vv_i : ndarray
+        uv coordinates of this channel's visibilities, in wavelengths.
+    vis_re_i, vis_imag_i : ndarray
+        Real and imaginary parts of the visibilities.
+    w_i : ndarray
+        Per-visibility measurement weights.
+    u_edges, v_edges : ndarray
+        Bin edges of the uv grid.
+    window_fn : callable
+        Bound window ``window(u, center)`` (see :mod:`viscube.windows`).
+    truncation_radius : float
+        Kernel truncation radius used to build ``pairs``.
+    uv_tree, grid_tree, pairs
+        Precomputed neighbor geometry from :func:`precompute_pairs`.
+    verbose_mean, verbose_std : int
+        Passed to :func:`bin_data` as ``verbose`` (currently unused there).
+
+    Returns
+    -------
+    vis_bin_re, std_bin_re, vis_bin_imag, std_bin_imag, counts : ndarray
+        Per-cell statistics, each of shape (Nu, Nv).
     """
     bins = (u_edges, v_edges)
-    params = (uu_i, vv_i, w_i, bins, window_fn, truncation_radius, uv_tree, grid_tree, pairs)
+    params = (w_i, None, bins, window_fn, truncation_radius, uv_tree, grid_tree, pairs)
 
-    vis_bin_re   = bin_data(uu_i, vv_i, vis_re_i, *params[2:], statistics_fn="mean",  verbose=verbose_mean)
-    std_bin_re   = bin_data(uu_i, vv_i, vis_re_i, *params[2:], statistics_fn="std",   verbose=verbose_std)
-    vis_bin_imag = bin_data(uu_i, vv_i, vis_imag_i, *params[2:], statistics_fn="mean", verbose=verbose_mean)
-    std_bin_imag = bin_data(uu_i, vv_i, vis_imag_i, *params[2:], statistics_fn="std",  verbose=verbose_std)
-    counts       = bin_data(uu_i, vv_i, vis_re_i,  *params[2:], statistics_fn="count", verbose=verbose_mean)
+    vis_bin_re   = bin_data(uu_i, vv_i, vis_re_i, *params, statistics_fn="mean",  verbose=verbose_mean)
+    std_bin_re   = bin_data(uu_i, vv_i, vis_re_i, *params, statistics_fn="std",   verbose=verbose_std)
+    vis_bin_imag = bin_data(uu_i, vv_i, vis_imag_i, *params, statistics_fn="mean", verbose=verbose_mean)
+    std_bin_imag = bin_data(uu_i, vv_i, vis_imag_i, *params, statistics_fn="std",  verbose=verbose_std)
+    counts       = bin_data(uu_i, vv_i, vis_re_i,  *params, statistics_fn="count", verbose=verbose_mean)
 
     return vis_bin_re, std_bin_re, vis_bin_imag, std_bin_imag, counts
 
 def uv_grid_to_fft_image_convention(arr_uv: np.ndarray) -> np.ndarray:
     """
-    Convert UV grid from [u, v] axis order to image/FFT-friendly [v, u] row/col order.
-    Works for 2D or cubes with last two axes = (Nu, Nv).
+    Convert a uv grid from [u, v] axis order to FFT/image [v, u] row/col order.
+
+    The gridding engines index cells as ``(u, v)``; FFT-based imaging code
+    expects row/col = ``(v, u)`` with the v axis flipped so that row 0 is
+    at the top (north up). This swaps the last two axes and flips the new
+    row axis. The result is elementwise aligned with a model's
+    ``fftshift(fft2(ifftshift(image)))`` plane.
+
+    Parameters
+    ----------
+    arr_uv : ndarray
+        Array whose last two axes are ``(Nu, Nv)`` — a single 2D plane or
+        a cube ``(F, Nu, Nv)``.
+
+    Returns
+    -------
+    ndarray
+        Array with last two axes ``(Nv, Nu)`` in image/FFT convention.
+
+    Notes
+    -----
+    The v-axis flip is deliberate and load-bearing for the output
+    orientation; do not remove it.
     """
     # swap last two axes: (..., u, v) -> (..., v, u)
-    #return np.swapaxes(arr_uv, -2, -1)
     return np.flip(np.swapaxes(arr_uv, -2, -1), axis=-2)
 
 
@@ -264,9 +470,28 @@ def uv_grid_to_fft_image_convention(arr_uv: np.ndarray) -> np.ndarray:
 
 def _bind_window(fn, pixel_size, window_kwargs):
     """
-    Return a callable window(u, center) with kwargs safely bound.
-    Only passes arguments that `fn` actually accepts.
-    Always passes pixel_size if `fn` accepts it and it's not already provided.
+    Return a callable ``window(u, center)`` with kwargs safely bound.
+
+    Only passes arguments that ``fn`` actually accepts, and always passes
+    ``pixel_size`` if ``fn`` accepts it and it is not already provided in
+    ``window_kwargs``.
+
+    Parameters
+    ----------
+    fn : callable
+        Base window function ``fn(u, center, **kwargs)`` from
+        :mod:`viscube.windows` (or user-supplied with the same signature).
+    pixel_size : float
+        uv cell size to bind as the window's ``pixel_size``.
+    window_kwargs : dict or None
+        Extra keyword arguments to bind (e.g. ``{"m": 6}``).
+
+    Returns
+    -------
+    callable
+        Two-argument window ``bound(u, center)``; the base function and
+        bound kwargs are exposed as ``bound._window_base`` and
+        ``bound._window_kwargs``.
     """
     params = inspect.signature(fn).parameters
     kw = dict(window_kwargs or {})
@@ -288,8 +513,29 @@ def _window_from_name(name: str,
                       window_kwargs: Optional[dict] = None
                       ):
     """
-    Build a window(u, center) callable from a string and a kwargs dict.
-    No assumptions about which kwargs exist; only forwards what the window accepts.
+    Build a bound ``window(u, center)`` callable from a window name.
+
+    Parameters
+    ----------
+    name : str
+        One of ``"kb"/"kaiser"/"kaiser_bessel"/"kaiser-bessel"``,
+        ``"pswf"/"casa"/"spheroidal"``, ``"pillbox"/"boxcar"``, ``"sinc"``
+        (case-insensitive).
+    pixel_size : float
+        uv cell size to bind as the window's ``pixel_size``.
+    window_kwargs : dict, optional
+        Extra keyword arguments; only those the chosen window accepts are
+        forwarded.
+
+    Returns
+    -------
+    callable
+        Bound two-argument window (see :func:`_bind_window`).
+
+    Raises
+    ------
+    ValueError
+        If ``name`` is not a recognized window name.
     """
     key = name.lower()
     if key in {"kb", "kaiser", "kaiser_bessel", "kaiser-bessel"}:
@@ -329,7 +575,79 @@ def grid_cube_all_stats(
     std_min_effective: int = 5,
     n_eff_mode: str = "both"
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Grid a spectral cube of visibilities and estimate per-cell statistics.
 
+    This is VisCube's main kernel-overlap gridder. For every channel it
+    builds the uv grid, gathers each cell's neighboring visibilities
+    (within ``truncation_radius = delta_u`` of the cell center), and
+    computes weighted means, hybrid standard errors (empirical scatter
+    with a propagated-variance fallback for low-information cells), and
+    counts. Inputs are expected to be hermitian-augmented already (see
+    :func:`hermitian_augment`).
+
+    See :func:`grid_cube_all_stats_nonoverlap` for a much faster
+    schema-identical alternative in which each visibility lands in exactly
+    one cell.
+
+    Parameters
+    ----------
+    frequencies : ndarray, shape (F,)
+        Channel frequencies in Hz (not used in the gridding itself; kept
+        for API symmetry with the extraction pipeline).
+    uu, vv : ndarray, shape (F, N)
+        uv coordinates per channel, in wavelengths.
+    vis_re, vis_imag : ndarray, shape (F, N)
+        Real and imaginary parts of the visibilities.
+    weight : ndarray, shape (F, N)
+        Per-visibility measurement weights, used for the means and the
+        empirical std branch.
+    invvar_group_re, invvar_group_im : ndarray, shape (F, N)
+        Per-visibility inverse variances of the real/imaginary parts (e.g.
+        ``1 / sigma**2`` with sigma from
+        :func:`viscube.sigma_per_baseline.sigma_by_baseline_scan_time_diff`).
+        Used ONLY in the low-info std fallback.
+    npix : int
+        Number of uv cells per axis.
+    fov_arcsec : float, optional
+        Image-plane field of view in arcseconds; if given, fixes
+        ``delta_u = 1 / fov_rad`` (see :func:`make_uv_grid`).
+    pad_uv : float
+        Fractional padding of the data extent in legacy grid mode; ignored
+        when ``fov_arcsec`` is given.
+    window_name : str, optional
+        Name of the gridding window (see :mod:`viscube.windows`); default
+        ``"kaiser_bessel"``. Ignored if ``window_fn`` is given.
+    window_kwargs : dict, optional
+        Extra keyword arguments for the window (e.g. ``{"m": 6}``).
+    window_fn : callable, optional
+        Ready-made window ``fn(u, center, **kwargs)`` overriding
+        ``window_name``.
+    p_metric : int
+        Minkowski p-norm for the neighbor search (1 = square support,
+        2 = circular).
+    std_p, std_workers : int
+        Passed through to :func:`viscube.gridder.bin_data` (currently
+        unused there; retained for backward compatibility).
+    std_min_effective : int
+        Cells with effective sample size below this threshold use the
+        propagated invvar fallback for the std.
+    n_eff_mode : {"geometric", "both"}
+        Effective-sample-size definition (see
+        :func:`viscube.gridder.bin_data`).
+
+    Returns
+    -------
+    mean_re, mean_im : ndarray, shape (F, npix, npix)
+        Gridded visibility means (real/imaginary), in FFT/image [v, u]
+        convention (see :func:`uv_grid_to_fft_image_convention`).
+    std_re, std_im : ndarray, shape (F, npix, npix)
+        Per-cell standard errors of the means (NaN where not estimable).
+    counts : ndarray, shape (F, npix, npix)
+        Number of contributing visibilities per cell (useful for masking).
+    u_edges, v_edges : ndarray, shape (npix+1,)
+        Bin edges of the uv grid (in the original [u, v] convention).
+    """
     u_edges, v_edges, delta_u, trunc_r = make_uv_grid(
         uu, vv, npix=npix, pad_uv=pad_uv, fov_arcsec=fov_arcsec, warn_crop=True
     )
@@ -438,22 +756,88 @@ def grid_cube_all_stats_nonoverlap(
     n_aug: Optional[int] = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
-    Non-overlapping drop-in alternative to `grid_cube_all_stats`: each
-    visibility lands in exactly ONE uv cell (searchsorted binning) with
-    within-bin weighting ``weight * KB(du)*KB(dv)`` (``m=1`` makes the KB
-    support coincide exactly with the bin; ``beta=0`` is a pillbox).
-    Output tuple and per-cell statistics are schema-identical to
-    `grid_cube_all_stats`.
+    Non-overlapping drop-in alternative to :func:`grid_cube_all_stats`.
 
-    drop_dc_duplicates / n_aug
-        When the inputs are hermitian-augmented (originals first, conjugate
-        copies appended), pass ``n_aug`` = number of ORIGINAL visibilities
-        per channel so that augmented copies landing in the DC cell are
-        dropped (otherwise a short-baseline visibility and its conjugate
-        both land there: imag forced to ~0, SE understated by sqrt(2)).
+    Each visibility lands in exactly ONE uv cell (searchsorted binning)
+    with within-bin weighting ``weight * KB(du)*KB(dv)`` (``m=1`` makes
+    the KB support coincide exactly with the bin; ``beta=0`` is a
+    pillbox). Output tuple and per-cell statistics are schema-identical to
+    :func:`grid_cube_all_stats`, but the vectorized binning is orders of
+    magnitude faster than the KDTree overlap path.
 
-    Loudly warns (RuntimeWarning) if ANY visibility falls outside the grid
-    (silently dropped baselines were a long-standing silent failure mode).
+    A forward model comparing against data gridded this way should
+    multiply its image by the matching analytic taper from
+    :func:`viscube.deapodization.make_kb_taper_map` (same ``m``/``beta``)
+    before the FFT.
+
+    Parameters
+    ----------
+    frequencies : ndarray, shape (F,)
+        Channel frequencies in Hz (not used in the gridding itself; kept
+        for API symmetry).
+    uu, vv : ndarray, shape (F, N)
+        uv coordinates per channel, in wavelengths (hermitian-augmented;
+        see :func:`hermitian_augment`).
+    vis_re, vis_imag : ndarray, shape (F, N)
+        Real and imaginary parts of the visibilities.
+    weight : ndarray, shape (F, N)
+        Per-visibility measurement weights.
+    invvar_group_re, invvar_group_im : ndarray, shape (F, N)
+        Per-visibility inverse variances of the real/imaginary parts, used
+        ONLY in the low-info std fallback.
+    npix : int
+        Number of uv cells per axis.
+    fov_arcsec : float, optional
+        Image-plane field of view in arcseconds; if given, fixes
+        ``delta_u = 1 / fov_rad`` (see :func:`make_uv_grid`).
+    pad_uv : float
+        Fractional padding of the data extent in legacy grid mode; ignored
+        when ``fov_arcsec`` is given.
+    m : int
+        Kaiser–Bessel within-bin kernel support in cells (``m=1``
+        recommended: kernel support == bin).
+    beta : float
+        Kaiser–Bessel shape parameter; ``beta = 0`` gives a pillbox.
+    std_min_effective : int
+        Cells with effective sample size below this threshold use the
+        propagated invvar fallback for the std.
+    n_eff_mode : {"geometric", "both"}
+        Effective-sample-size definition (see
+        :func:`viscube.gridder.bin_data`).
+    drop_dc_duplicates : bool
+        Drop hermitian-augmented copies that land in the DC cell (default
+        True; requires ``n_aug``). Set False only if the input is NOT
+        hermitian-augmented.
+    n_aug : int, optional
+        Number of ORIGINAL (pre-augmentation) visibilities per channel,
+        i.e. the first ``n_aug`` entries are originals and the rest are
+        conjugate copies. Without DC dedup, a short-baseline visibility
+        and its conjugate both land in the DC cell: imag forced to ~0 and
+        SE understated by sqrt(2).
+
+    Returns
+    -------
+    mean_re, mean_im : ndarray, shape (F, npix, npix)
+        Gridded visibility means (real/imaginary), in FFT/image [v, u]
+        convention.
+    std_re, std_im : ndarray, shape (F, npix, npix)
+        Per-cell standard errors of the means (NaN where not estimable).
+    counts : ndarray, shape (F, npix, npix)
+        Number of contributing visibilities per cell.
+    u_edges, v_edges : ndarray, shape (npix+1,)
+        Bin edges of the uv grid (in the original [u, v] convention).
+
+    Warns
+    -----
+    RuntimeWarning
+        If ANY visibility falls outside the grid (silently dropped
+        baselines were a long-standing silent failure mode); the dropped
+        fraction and worst channel are reported.
+
+    Raises
+    ------
+    ValueError
+        If ``drop_dc_duplicates=True`` and ``n_aug`` is not given.
     """
     if drop_dc_duplicates and n_aug is None:
         raise ValueError(
@@ -549,10 +933,35 @@ def grid_cube_all_stats_nonoverlap(
 
 def half_plane_slab(arr_conv: np.ndarray, npix: int) -> np.ndarray:
     """
-    Slice the non-redundant Hermitian half-plane slab (rows [npix//2:]) out
-    of a full-plane array in FFT/image convention (last two axes (npix, npix)).
-    Result shape (..., (npix+1)//2, npix). Requires ODD npix (even npix has a
-    Nyquist row that breaks the slab symmetry).
+    Slice the non-redundant Hermitian half-plane slab out of a full plane.
+
+    For a real image, the fftshifted uv plane of odd side ``npix`` is
+    Hermitian-symmetric under ``(row, col) -> (2c-row, 2c-col)`` with
+    ``c = npix // 2``: every cell with ``row > c`` has its conjugate
+    duplicate at ``row < c``. The non-redundant half is therefore the slab
+    of rows ``[c:]`` — with the caveat that the DC row (slab row 0) still
+    mirrors onto itself; apply :func:`half_plane_mask_fix` to the
+    corresponding mask slab to remove those duplicates.
+
+    Parameters
+    ----------
+    arr_conv : ndarray
+        Full-plane array in FFT/image convention, last two axes
+        ``(npix, npix)`` (e.g. an output of :func:`grid_cube_all_stats`).
+    npix : int
+        Grid side length. Must be ODD (even npix has a Nyquist row that
+        breaks the slab symmetry).
+
+    Returns
+    -------
+    ndarray
+        View of the slab rows ``[npix//2:]``, shape
+        ``(..., (npix+1)//2, npix)``.
+
+    Raises
+    ------
+    ValueError
+        If ``npix`` is even or the last two axes are not (npix, npix).
     """
     npix = int(npix)
     if npix % 2 != 1:
@@ -566,10 +975,32 @@ def half_plane_slab(arr_conv: np.ndarray, npix: int) -> np.ndarray:
 
 def half_plane_mask_fix(mask_slab: np.ndarray, npix: int) -> np.ndarray:
     """
-    Zero the conjugate-duplicate columns of the DC row in a half-plane mask
-    slab: slab row 0 is the self-mirroring DC row, whose columns [0:npix//2]
-    duplicate columns [npix//2+1:]. Returns a copy; the DC cell itself
-    (slab[..., 0, npix//2]) is KEPT.
+    Zero the conjugate-duplicate DC-row columns of a half-plane mask slab.
+
+    Slab row 0 (see :func:`half_plane_slab`) is the self-mirroring DC row,
+    whose columns ``[0:npix//2]`` duplicate columns ``[npix//2+1:]``. Using
+    both halves of that row would double-count those cells in a
+    half-plane likelihood.
+
+    Parameters
+    ----------
+    mask_slab : ndarray
+        Half-plane mask slab, last two axes ``((npix+1)//2, npix)``
+        (boolean or numeric).
+    npix : int
+        Full-plane side length (odd).
+
+    Returns
+    -------
+    ndarray
+        Copy of ``mask_slab`` with columns ``[0:npix//2]`` of slab row 0
+        zeroed (set to False for boolean masks). The DC cell itself
+        (``slab[..., 0, npix//2]``) is KEPT.
+
+    Raises
+    ------
+    ValueError
+        If the last two axes are not ``((npix+1)//2, npix)``.
     """
     npix = int(npix)
     c = npix // 2
@@ -673,7 +1104,82 @@ def grid_cube_all_stats_wbinned(
     np.ndarray, np.ndarray, np.ndarray
 ]:
     """
-    Grid complex visibilities into UVW-binned UV pixels using `bin_data`.
+    Grid complex visibilities into w-binned uv pixels (UVW gridding).
+
+    Like :func:`grid_cube_all_stats`, but each channel's visibilities are
+    first partitioned into bins of the w coordinate and gridded per w-bin,
+    yielding a ``(F, Nw, npix, npix)`` hypercube. Useful when the array is
+    non-coplanar and the w term cannot be ignored.
+
+    Parameters
+    ----------
+    frequencies : ndarray, shape (F,)
+        Channel frequencies in Hz (not used in the gridding itself; kept
+        for API symmetry).
+    uu, vv, ww : ndarray, shape (F, N)
+        uvw coordinates per channel, in wavelengths (hermitian-augmented;
+        note w must flip sign along with u, v).
+    vis_re, vis_imag : ndarray, shape (F, N)
+        Real and imaginary parts of the visibilities.
+    weight : ndarray, shape (F, N)
+        Per-visibility measurement weights.
+    invvar_group_re, invvar_group_im : ndarray, shape (F, N)
+        Per-visibility inverse variances of the real/imaginary parts, used
+        ONLY in the low-info std fallback.
+    npix : int
+        Number of uv cells per axis.
+    fov_arcsec : float, optional
+        Image-plane field of view in arcseconds; if given, fixes
+        ``delta_u = 1 / fov_rad`` (see :func:`make_uv_grid`).
+    pad_uv : float
+        Fractional padding of the data extent in legacy grid mode; ignored
+        when ``fov_arcsec`` is given.
+    w_bins : int or ndarray
+        Number of uniform w bins, or explicit bin edges (see
+        :func:`_make_w_edges`).
+    w_range : (float, float), optional
+        Range for uniform w bins; defaults to the data min/max.
+    w_abs : bool
+        If True, bin ``|w|`` instead of w (often increases per-bin counts).
+    window_name : str, optional
+        Name of the gridding window (see :mod:`viscube.windows`). Ignored
+        if ``window_fn`` is given.
+    window_kwargs : dict, optional
+        Extra keyword arguments for the window (e.g. ``{"m": 6}``).
+    window_fn : callable, optional
+        Ready-made window ``fn(u, center, **kwargs)`` overriding
+        ``window_name``.
+    p_metric : int
+        Minkowski p-norm for the neighbor search.
+    std_p, std_workers : int
+        Passed through to :func:`viscube.gridder.bin_data` (currently
+        unused there; retained for backward compatibility).
+    std_min_effective : int
+        Cells with effective sample size below this threshold use the
+        propagated invvar fallback for the std.
+    tqdm_ncols : int
+        Width of the progress bars.
+    n_eff_mode : {"geometric", "both"}
+        Effective-sample-size definition (see
+        :func:`viscube.gridder.bin_data`).
+
+    Returns
+    -------
+    mean_re, mean_im : ndarray, shape (F, Nw, npix, npix)
+        Gridded visibility means per w-bin, in FFT/image [v, u] convention.
+    std_re, std_im : ndarray, shape (F, Nw, npix, npix)
+        Per-cell standard errors (NaN where not estimable or w-bin empty).
+    counts : ndarray, shape (F, Nw, npix, npix)
+        Number of contributing visibilities per cell.
+    u_edges, v_edges : ndarray, shape (npix+1,)
+        Bin edges of the uv grid (in the original [u, v] convention).
+    w_edges : ndarray, shape (Nw+1,)
+        Bin edges of the w axis.
+
+    Raises
+    ------
+    ValueError
+        If the input array shapes are inconsistent.
     """
 
     # -----------------------
