@@ -8,7 +8,7 @@ One of the critical preprocessing steps one must take in order to use VisCube is
 
 Of these, option 1 is the least flexible, so I do not include instructions on how to do it. 
 
-For option 2, see the [intro tutorial on extracting data with CASA](https://viscube.readthedocs.io/en/latest/notebooks/casa_io_basic.html), the [lower-level CASA interface tutorial](https://viscube.readthedocs.io/en/latest/notebooks/casa_io_casacore_table.html) as well as the [tutorial on combining multiple observations with CASA](https://viscube.readthedocs.io/en/latest/notebooks/combining_low_high_res_casa.html). If you run out of memory in the process, you can pay a visit to [this notebook](https://viscube.readthedocs.io/en/latest/notebooks/casa_io_large_ms_bychan.html). 
+For option 2, see the [intro tutorial on extracting data with CASA](https://viscube.readthedocs.io/en/latest/notebooks/casa_io_basic.html), the [lower-level CASA interface tutorial](https://viscube.readthedocs.io/en/latest/notebooks/casa_io_casacore_table.html) as well as the [tutorial on combining multiple observations with CASA](https://viscube.readthedocs.io/en/latest/notebooks/combining_low_high_res_casa.html) (which continues past extraction, all the way through gridding and half-plane storage of the combined dataset). If you run out of memory in the process, you can pay a visit to [this notebook](https://viscube.readthedocs.io/en/latest/notebooks/casa_io_large_ms_bychan.html). 
 
 For an example of option 3, see the [intro tutorial on XRADIO with VisCube](https://viscube.readthedocs.io/en/latest/notebooks/xradio_uvw_continuum.html). Between option 2 and option 3, you should be able to find a reliable solution for your specific data. 
 

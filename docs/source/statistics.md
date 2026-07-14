@@ -14,9 +14,9 @@ $$n_{eff} = \frac{\left( \sum_{i=1}^N w_i \right)^2}{ \sum_{i=1}^N (w_i)^2}$$
 
 The weights $w_i$ are defined by the gridding convolutional function's value at that (u,v) point multiplied by that visibility's weight as extracted from the measurement set. 
 
-If a cell lacks sufficient numbers of visibilities to calculate an uncertainty, VisCube uses the neighboring visibilities from same [scan](https://casaguides.nrao.edu/index.php/Glossary_for_ALMA_Data_Processing) to estimate the uncertainty.
+If a cell lacks sufficient numbers of visibilities to calculate an uncertainty, VisCube uses the neighboring visibilities from same [scan](https://casaguides.nrao.edu/index.php/Glossary_for_ALMA_Data_Processing) to estimate the uncertainty by subtracting pairs of neighboring visibilities (thereby removing most of the signal and leaving mostly noise).
 
-Note that due to Hermitian augmentation, each visibility shows up twice in the gridded cells. If you are using the gridded data as input to a Gaussian likelihood, the best way to account for this is to remove the duplicates by using the half-plane tools of VisCube.
+Note that due to Hermitian augmentation, each visibility shows up twice in the gridded cells. If you are using the gridded data as input to a Gaussian likelihood, the best way to account for this is to remove the duplicates by using the half-plane tools of VisCube (`half_plane_slab` and `half_plane_mask_fix`). For a worked example — including the DC-row fix — see [Step 9 of the Beginner's Guide](https://viscube.readthedocs.io/en/latest/notebooks/example_basic.html#step-9-slice-to-the-hermitian-half-plane-for-gaussian-likelihoods).
 
 References: 
 
