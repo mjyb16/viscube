@@ -14,8 +14,9 @@ $$n_{eff} = \frac{\left( \sum_{i=1}^N w_i \right)^2}{ \sum_{i=1}^N (w_i)^2}$$
 
 The weights $w_i$ are defined by the gridding convolutional function's value at that (u,v) point multiplied by that visibility's weight as extracted from the measurement set. 
 
-Since $\sigma$ is technically a standard error calculated from the sample variance, the effective probability distribution distribution is not Gaussian, but rather [T-distributed](https://en.wikipedia.org/wiki/Student%27s_t-distribution#Occurrence_and_applications). This means that if you use the uncertainties calculated by VisCube in a Gaussian likelihood, you must compensate for the increased density in the tails of the T distribution. A simple rule of thumb is to just multiply the VisCube standard errors by a factor of 2.
+If a cell lacks sufficient numbers of visibilities to calculate an uncertainty, VisCube uses the neighboring visibilities from same [scan](https://casaguides.nrao.edu/index.php/Glossary_for_ALMA_Data_Processing) to estimate the uncertainty.
 
+Note that due to Hermitian augmentation, each visibility shows up twice in the gridded cells. If you are using the gridded data as input to a Gaussian likelihood, the best way to account for this is to remove the duplicates by using the half-plane tools of VisCube.
 
 References: 
 
