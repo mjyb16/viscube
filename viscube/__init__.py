@@ -31,6 +31,8 @@ from .grid_cube import (
     build_grid_centers,
     half_plane_slab,
     half_plane_mask_fix,
+    hermitian_full_from_slab,
+    real_full_from_slab,
 )
 
 from .gridder import bin_channel_nonoverlap

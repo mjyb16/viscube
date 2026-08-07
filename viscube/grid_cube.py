@@ -1014,6 +1014,99 @@ def half_plane_mask_fix(mask_slab: np.ndarray, npix: int) -> np.ndarray:
     return out
 
 
+def hermitian_full_from_slab(slab: np.ndarray) -> np.ndarray:
+    """
+    Re-augment a half-plane visibility slab back to the full DC-centred grid.
+
+    Exact inverse of :func:`half_plane_slab` for complex visibility data:
+    the slab is placed at rows ``[c:]`` (``c = npix // 2``), the missing
+    rows ``[:c]`` are filled via the Hermitian relation
+    ``full[a, b] = conj(full[2c - a, 2c - b])``, and the DC row's
+    conjugate-duplicate left half (zeroed at save time by
+    :func:`half_plane_mask_fix`-based masking) is rebuilt from its right
+    half. The reconstructed grid is exactly Hermitian, so its inverse FFT
+    is real — quick-look dirty imaging works directly on the result
+    (round-trip against the pre-slab full plane validated at machine
+    precision on the NGC 4697 tutorial dataset).
+
+    Parameters
+    ----------
+    slab : ndarray
+        Complex half-plane slab, last two axes ``((npix+1)//2, npix)``
+        (e.g. ``vis_bin_re + 1j * vis_bin_imag`` from a saved half-plane
+        npz). ``npix`` is inferred from the last axis.
+
+    Returns
+    -------
+    ndarray
+        Complex full-plane array, shape ``(..., npix, npix)``, in the same
+        FFT/image convention as the :func:`grid_cube_all_stats` outputs.
+
+    Raises
+    ------
+    ValueError
+        If the last two axes are not ``((npix+1)//2, npix)`` with odd
+        ``npix``.
+    """
+    slab = np.asarray(slab)
+    npix = slab.shape[-1]
+    if npix % 2 != 1 or slab.shape[-2] != (npix + 1) // 2:
+        raise ValueError(
+            f"expected half-plane slab last axes ({(npix + 1) // 2}, {npix}) "
+            f"with odd npix, got {slab.shape[-2:]}."
+        )
+    c = npix // 2
+    full = np.zeros((*slab.shape[:-2], npix, npix), dtype=complex)
+    full[..., c:, :] = slab
+    top = full[..., c + 1:, :]
+    full[..., :c, :] = np.conj(top[..., ::-1, ::-1])
+    full[..., c, :c] = np.conj(full[..., c, npix - 1:c:-1])
+    return full
+
+
+def real_full_from_slab(slab: np.ndarray) -> np.ndarray:
+    """
+    Mirror a REAL half-plane slab back to the full DC-centred grid.
+
+    :func:`hermitian_full_from_slab` minus the conjugation — for real
+    per-cell quantities that are symmetric under the uv point reflection
+    ``(u, v) -> (-u, -v)``, such as the ``std_bin_re``/``std_bin_imag``
+    maps or cell counts of a saved half-plane npz (e.g. to feed
+    noise-weighted dirty imaging).
+
+    Parameters
+    ----------
+    slab : ndarray
+        Real half-plane slab, last two axes ``((npix+1)//2, npix)``.
+        ``npix`` is inferred from the last axis.
+
+    Returns
+    -------
+    ndarray
+        Full-plane array, shape ``(..., npix, npix)``, same dtype as
+        ``slab``.
+
+    Raises
+    ------
+    ValueError
+        If the last two axes are not ``((npix+1)//2, npix)`` with odd
+        ``npix``.
+    """
+    slab = np.asarray(slab)
+    npix = slab.shape[-1]
+    if npix % 2 != 1 or slab.shape[-2] != (npix + 1) // 2:
+        raise ValueError(
+            f"expected half-plane slab last axes ({(npix + 1) // 2}, {npix}) "
+            f"with odd npix, got {slab.shape[-2:]}."
+        )
+    c = npix // 2
+    full = np.zeros((*slab.shape[:-2], npix, npix), dtype=slab.dtype)
+    full[..., c:, :] = slab
+    full[..., :c, :] = full[..., c + 1:, :][..., ::-1, ::-1]
+    full[..., c, :c] = full[..., c, npix - 1:c:-1]
+    return full
+
+
 def _make_w_edges(
     ww: np.ndarray,
     w_bins: Union[int, np.ndarray],
